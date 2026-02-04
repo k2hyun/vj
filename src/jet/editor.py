@@ -738,6 +738,29 @@ class JsonEditor(Widget, can_focus=True):
             self.command_buffer += char
 
     def _exec_command(self, cmd: str) -> None:
+        stripped = cmd.strip()
+
+        # Line jump: :l<num> → logical (editor) line; :<num> or :p<num> → physical (JSONL record)
+        if len(stripped) > 1 and stripped[0] == "l" and stripped[1:].isdigit():
+            num = int(stripped[1:])
+            self.cursor_row = max(0, min(num - 1, len(self.lines) - 1))
+            self.cursor_col = 0
+            return
+        if stripped.isdigit() or (len(stripped) > 1 and stripped[0] == "p" and stripped[1:].isdigit()):
+            num = int(stripped if stripped.isdigit() else stripped[1:])
+            if self.jsonl:
+                records = self._jsonl_line_records()
+                for i, rec in enumerate(records):
+                    if rec == num:
+                        self.cursor_row = i
+                        self.cursor_col = 0
+                        return
+                self.status_msg = f"record {num} not found"
+                return
+            self.cursor_row = max(0, min(num - 1, len(self.lines) - 1))
+            self.cursor_col = 0
+            return
+
         parts = cmd.split(None, 1)
         verb = parts[0] if parts else ""
         arg = parts[1] if len(parts) > 1 else ""
