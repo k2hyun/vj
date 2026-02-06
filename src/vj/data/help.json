@@ -15,7 +15,8 @@
         "N": "previous match",
         "Up/Down": "search history",
         "\\c \\C": "case insensitive/sensitive",
-        "\\j": "JSONPath search (e.g. /$.key\\j)"
+        "/$. /$[": "JSONPath search (auto-detect)",
+        "\\j": "JSONPath suffix for other patterns"
     },
     "Insert Mode": {
         "i I": "insert at cursor/line start",

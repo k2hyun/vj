@@ -1100,9 +1100,12 @@ class JsonEditor(Widget, can_focus=True):
         pattern = self._search_buffer
         self._search_pattern = pattern
 
-        # Check for JSONPath flag
+        # Check for JSONPath: explicit \j suffix or pattern starting with $. or $[
         if pattern.endswith("\\j"):
             self._execute_jsonpath_search(pattern[:-2])
+            return
+        if pattern.startswith("$.") or pattern.startswith("$["):
+            self._execute_jsonpath_search(pattern)
             return
 
         # Check for case sensitivity flags
