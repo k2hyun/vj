@@ -2,14 +2,16 @@
 
 A modal JSON editor built with [Textual](https://github.com/Textualize/textual), featuring vim-style keybindings.
 
+[한국어](README.kr.md)
+
 ## Features
 
 - **Vim-style modal editing** - Normal, Insert, Command, and Search modes
 - **Syntax highlighting** - JSON-aware colorization
 - **JSON validation** - Real-time validation with error reporting
 - **JSONPath search** - Search using JSONPath expressions (`$.foo.bar`)
-- **JSONL support** - Edit JSON Lines files with record-aware navigation
-- **Embedded JSON editing** - Edit JSON strings within JSON (nested levels)
+- **JSONL support** - Edit JSON Lines files with smart formatting
+- **Embedded JSON editing** - Edit JSON strings within JSON with nested level support
 - **Bracket matching** - Jump to matching brackets with `%`
 - **Undo/Redo** - Full undo history
 
@@ -31,6 +33,74 @@ vj -R data.json
 # Create new file
 vj newfile.json
 ```
+
+## JSONL Support
+
+vj provides special handling for JSON Lines (`.jsonl`) files:
+
+- **Pretty-printed editing**: Each JSONL record is automatically formatted with indentation for easy reading and editing
+- **Compact saving**: When you save, each record is minified back to a single line, preserving the JSONL format
+- **Record numbers**: A second column shows the record number (1, 2, 3...) for easy navigation
+- **Floating header**: When scrolling through a multi-line record, the physical line number stays visible at the top
+
+Example: A JSONL file with two records:
+```
+{"name": "Alice", "age": 30}
+{"name": "Bob", "age": 25}
+```
+
+Opens in vj as:
+```
+{
+    "name": "Alice",
+    "age": 30
+}
+{
+    "name": "Bob",
+    "age": 25
+}
+```
+
+And saves back to the original compact format.
+
+## Embedded JSON Editing
+
+JSON files often contain escaped JSON strings as values. vj lets you edit these nested JSON structures naturally.
+
+### How it works
+
+1. Position your cursor on a line containing a JSON string value
+2. Type `ej` in normal mode
+3. A new editor panel opens with the parsed and formatted JSON
+4. Edit the embedded JSON with full syntax highlighting and validation
+5. Save with `:w` to update the parent document (minified) or `:q` to cancel
+
+### Nested levels
+
+You can edit embedded JSON within embedded JSON:
+- The panel title shows the current nesting level: `Edit Embedded JSON (level 1)`
+- A `[+]` indicator appears when you have unsaved changes
+- `:w` saves and returns to the previous level
+- `:q!` discards changes and returns to the previous level
+
+### Example
+
+Given this JSON:
+```json
+{
+    "config": "{\"host\": \"localhost\", \"port\": 8080}"
+}
+```
+
+Using `ej` on the config line opens:
+```json
+{
+    "host": "localhost",
+    "port": 8080
+}
+```
+
+After editing and saving, the parent is updated with the minified result.
 
 ## Keybindings
 
