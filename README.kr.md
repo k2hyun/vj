@@ -1,4 +1,6 @@
-# vj
+# jets
+
+**J**SON **E**ditor in **T**extual with vim-**S**tyle keybindings.
 
 [Textual](https://github.com/Textualize/textual) 기반의 vim 스타일 모달 JSON 편집기입니다.
 
@@ -16,7 +18,7 @@
 ## 설치
 
 ```bash
-pip install -e .
+pip install vim-json-editor
 ```
 
 ## 사용법

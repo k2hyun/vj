@@ -1,6 +1,6 @@
-# vj
+# jets
 
-A modal JSON editor built with [Textual](https://github.com/Textualize/textual), featuring vim-style keybindings.
+**J**SON **E**ditor in **T**extual with vim-**S**tyle keybindings.
 
 [한국어](README.kr.md)
 
@@ -18,7 +18,7 @@ A modal JSON editor built with [Textual](https://github.com/Textualize/textual),
 ## Installation
 
 ```bash
-pip install -e .
+pip install vim-json-editor
 ```
 
 ## Usage
