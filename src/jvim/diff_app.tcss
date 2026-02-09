@@ -1,0 +1,23 @@
+Screen {
+    layout: vertical;
+}
+#diff-container {
+    width: 1fr;
+    height: 1fr;
+}
+#left-panel {
+    width: 1fr;
+    height: 1fr;
+}
+#right-panel {
+    width: 1fr;
+    height: 1fr;
+}
+#left-title, #right-title {
+    height: auto;
+    padding: 0 1;
+    background: $accent;
+}
+#left-editor, #right-editor {
+    height: 1fr;
+}

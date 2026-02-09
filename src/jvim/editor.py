@@ -369,6 +369,10 @@ class JsonEditor(Widget, can_focus=True):
     # Rendering
     # =====================================================================
 
+    def _line_background(self, line_idx: int) -> str:
+        """서브클래스에서 라인별 배경 스타일을 지정하기 위한 훅."""
+        return ""
+
     def render(self) -> Text:
         width = self.content_region.width
         height = self.content_region.height
@@ -449,6 +453,12 @@ class JsonEditor(Widget, can_focus=True):
                 line_styles = compute_styles(line)
                 style_cache[line_idx] = line_styles[:]
 
+            # 라인 배경 (diff 하이라이팅 등 서브클래스용 훅)
+            line_bg = self._line_background(line_idx)
+            if line_bg:
+                for c in range(len(line_styles)):
+                    line_styles[c] = f"{line_bg} {line_styles[c]}"
+
             # Apply search highlighting using indexed lookup
             if search_by_row and line_idx in search_by_row:
                 for m_start, m_end, mi in search_by_row[line_idx]:
@@ -487,6 +497,14 @@ class JsonEditor(Widget, can_focus=True):
                 # Cursor block at end of line (insert mode)
                 if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
                     result_append(result, " ", style="reverse")
+                # 라인 배경이 있으면 나머지 너비를 배경색으로 채움
+                if line_bg:
+                    seg_w = sum(char_width(line[c]) for c in range(s_start, s_end))
+                    if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
+                        seg_w += 1
+                    pad = avail - seg_w
+                    if pad > 0:
+                        result_append(result, " " * pad, style=line_bg)
                 result_append(result, "\n")
                 rows_used += 1
 
