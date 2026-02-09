@@ -21,3 +21,36 @@ Screen {
 #left-editor, #right-editor {
     height: 1fr;
 }
+#left-ej-panel, #right-ej-panel {
+    height: 50%;
+    display: none;
+}
+#left-ej-panel.visible, #right-ej-panel.visible {
+    display: block;
+}
+#left-ej-header, #right-ej-header {
+    height: auto;
+    padding: 0 1;
+    background: $warning;
+}
+#left-ej-title, #right-ej-title {
+    width: 1fr;
+    padding: 0;
+}
+#left-ej-close, #right-ej-close {
+    min-width: 3;
+    width: 3;
+    height: 1;
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: $text;
+}
+#left-ej-close:hover, #right-ej-close:hover {
+    background: $error;
+    color: $text;
+}
+#left-ej-editor, #right-ej-editor {
+    height: 1fr;
+}

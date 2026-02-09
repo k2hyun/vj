@@ -3,27 +3,53 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Header, Static
+from textual.widgets import Button, Header, Static
 
-from .diff import DiffHunk, DiffResult, DiffTag, compute_json_diff
+from rich.text import Text
+
+from .diff import DiffHunk, DiffTag, compute_json_diff
 from .editor import JsonEditor
 
 
-class DiffEditor(JsonEditor):
-    """JsonEditor 서브클래스: diff 배경 하이라이팅과 hunk 네비게이션."""
+class SyncJsonEditor(JsonEditor):
+    """스크롤 동기화를 지원하는 JsonEditor."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._sync_target: SyncJsonEditor | None = None
+
+    def _ensure_cursor_visible(self, avail: int) -> None:
+        if not self.has_focus and self._sync_target is not None:
+            return
+        super()._ensure_cursor_visible(avail)
+
+    def render(self) -> Text:
+        if not self.has_focus and self._sync_target is not None:
+            self._scroll_top = self._sync_target._scroll_top
+        result = super().render()
+        if self.has_focus and self._sync_target is not None:
+            if self._sync_target._scroll_top != self._scroll_top:
+                self._sync_target._scroll_top = self._scroll_top
+                self._sync_target.refresh()
+        return result
+
+
+class DiffEditor(SyncJsonEditor):
+    """SyncJsonEditor 서브클래스: diff 배경 하이라이팅과 hunk 네비게이션."""
 
     # diff 태그별 배경색
     _DIFF_BG = {
-        DiffTag.DELETE: "on #3c1616",
-        DiffTag.INSERT: "on #1a3320",
-        DiffTag.REPLACE: "on #3c3016",
+        DiffTag.DELETE: "on #5e1a1a",
+        DiffTag.INSERT: "on #1a4a2a",
+        DiffTag.REPLACE: "on #4a3a14",
     }
-    _FILLER_BG = "on #262626"
+    _FILLER_BG = "on #363636"
 
     def __init__(
         self,
@@ -52,6 +78,9 @@ class DiffEditor(JsonEditor):
         self._filler_rows = filler_rows
         self._diff_hunks = hunks
         self._current_hunk = -1
+        self.cursor_row = 0
+        self.cursor_col = 0
+        self._scroll_top = 0
         self._invalidate_caches()
         self.refresh()
 
@@ -142,6 +171,8 @@ class JsonDiffApp(App):
         self.right_path = right_path
         self.normalize = normalize
         self.jsonl = jsonl
+        self._left_ej_stack: list[str] = []
+        self._right_ej_stack: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -149,9 +180,19 @@ class JsonDiffApp(App):
             with Vertical(id="left-panel"):
                 yield Static(f"[b]{self.left_path}[/b]", id="left-title")
                 yield DiffEditor("", id="left-editor")
+                with Vertical(id="left-ej-panel"):
+                    with Horizontal(id="left-ej-header"):
+                        yield Static("[b]Embedded JSON[/b]", id="left-ej-title")
+                        yield Button("\u2715", id="left-ej-close", variant="error")
+                    yield DiffEditor("", id="left-ej-editor")
             with Vertical(id="right-panel"):
                 yield Static(f"[b]{self.right_path}[/b]", id="right-title")
                 yield DiffEditor("", id="right-editor")
+                with Vertical(id="right-ej-panel"):
+                    with Horizontal(id="right-ej-header"):
+                        yield Static("[b]Embedded JSON[/b]", id="right-ej-title")
+                        yield Button("\u2715", id="right-ej-close", variant="error")
+                    yield DiffEditor("", id="right-ej-editor")
 
     def on_mount(self) -> None:
         left_content = Path(self.left_path).read_text(encoding="utf-8")
@@ -188,37 +229,215 @@ class JsonDiffApp(App):
             right_fillers, diff_result.hunks,
         )
 
+        # 렌더 타임 스크롤 동기화 설정
+        left_editor._sync_target = right_editor
+        right_editor._sync_target = left_editor
+
+        # EJ 패널 스크롤 동기화
+        left_ej = self.query_one("#left-ej-editor", DiffEditor)
+        right_ej = self.query_one("#right-ej-editor", DiffEditor)
+        left_ej._sync_target = right_ej
+        right_ej._sync_target = left_ej
+
         left_editor._update_hunk_status()
         right_editor._update_hunk_status()
         left_editor.focus()
 
-    def on_key(self) -> None:
-        """동기 스크롤: 포커스된 패널의 scroll_top을 다른 쪽에 복사."""
-        left = self.query_one("#left-editor", DiffEditor)
-        right = self.query_one("#right-editor", DiffEditor)
-        focused = self.focused
-
-        if focused is left:
-            right._scroll_top = left._scroll_top
-            right.refresh()
-        elif focused is right:
-            left._scroll_top = right._scroll_top
-            left.refresh()
-
     def on_json_editor_quit(self, event: JsonEditor.Quit) -> None:
-        self.exit()
+        focused = self.focused
+        fid = focused.id if focused else ""
+        if fid in ("left-ej-editor", "right-ej-editor"):
+            side = "left" if fid == "left-ej-editor" else "right"
+            self._close_ej_panel(side)
+        else:
+            self.exit()
 
     def on_json_editor_force_quit(self, event: JsonEditor.ForceQuit) -> None:
-        self.exit()
+        focused = self.focused
+        fid = focused.id if focused else ""
+        if fid in ("left-ej-editor", "right-ej-editor"):
+            side = "left" if fid == "left-ej-editor" else "right"
+            self._close_ej_panel(side)
+        else:
+            self.exit()
+
+    def on_json_editor_embedded_edit_requested(
+        self, event: JsonEditor.EmbeddedEditRequested
+    ) -> None:
+        focused = self.focused
+        if focused is None:
+            return
+        fid = focused.id
+        if fid in ("left-editor", "left-ej-editor"):
+            side = "left"
+            other_side = "right"
+        elif fid in ("right-editor", "right-ej-editor"):
+            side = "right"
+            other_side = "left"
+        else:
+            return
+
+        # EJ 에디터에서 중첩 호출
+        if fid == f"{side}-ej-editor":
+            ej_stack = self._left_ej_stack if side == "left" else self._right_ej_stack
+            other_ej_stack = self._right_ej_stack if side == "left" else self._left_ej_stack
+            ej_editor = self.query_one(f"#{side}-ej-editor", DiffEditor)
+            other_ej_editor = self.query_one(f"#{other_side}-ej-editor", DiffEditor)
+
+            this_content = event.content
+            other_content = self._find_ej_content_in(
+                other_ej_editor, event.source_row,
+            )
+
+            ej_stack.append(ej_editor.get_content())
+            if other_content is not None:
+                other_ej_stack.append(other_ej_editor.get_content())
+                left_content = this_content if side == "left" else other_content
+                right_content = other_content if side == "left" else this_content
+                self._open_ej_with_diff(left_content, right_content)
+                self._update_ej_title(other_side)
+            else:
+                lines = this_content.split("\n") if this_content else [""]
+                tags = [DiffTag.EQUAL] * len(lines)
+                ej_editor.set_diff_data(lines, tags, set(), [])
+
+            self._update_ej_title(side)
+            ej_editor.focus()
+            return
+
+        # diff 에디터에서 ej 호출 → 양쪽 diff 표시
+        this_content = event.content
+        other_editor = self.query_one(f"#{other_side}-editor", DiffEditor)
+        other_content = self._find_ej_content_in(other_editor, event.source_row)
+
+        if other_content is not None:
+            left_content = this_content if side == "left" else other_content
+            right_content = other_content if side == "left" else this_content
+            self._open_ej_with_diff(left_content, right_content)
+        else:
+            ej_editor = self.query_one(f"#{side}-ej-editor", DiffEditor)
+            ej_panel = self.query_one(f"#{side}-ej-panel")
+            lines = this_content.split("\n") if this_content else [""]
+            tags = [DiffTag.EQUAL] * len(lines)
+            ej_editor.set_diff_data(lines, tags, set(), [])
+            self._update_ej_title(side)
+            ej_panel.add_class("visible")
+
+        self.query_one(f"#{side}-ej-editor", DiffEditor).focus()
+
+    def _find_ej_content_in(
+        self, editor: DiffEditor, source_row: int,
+    ) -> str | None:
+        """에디터의 지정 행에서 임베디드 JSON을 찾아 포맷팅된 문자열 반환."""
+        if source_row >= len(editor.lines):
+            return None
+
+        saved_row = editor.cursor_row
+        editor.cursor_row = source_row
+        result = editor._find_string_at_cursor()
+        editor.cursor_row = saved_row
+
+        if result is None:
+            return None
+
+        _, _, content = result
+        try:
+            parsed = json.loads(content)
+            if not isinstance(parsed, (list, dict)):
+                return None
+            return json.dumps(parsed, indent=4, ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _open_ej_with_diff(
+        self, left_content: str, right_content: str
+    ) -> None:
+        """양쪽 EJ 패널에 diff 결과를 표시."""
+        diff_result = compute_json_diff(
+            left_content, right_content, normalize=False,
+        )
+
+        left_ej = self.query_one("#left-ej-editor", DiffEditor)
+        right_ej = self.query_one("#right-ej-editor", DiffEditor)
+
+        left_fillers = {
+            i for i, (line, tag) in enumerate(
+                zip(diff_result.left_lines, diff_result.left_line_tags)
+            )
+            if not line and tag != DiffTag.EQUAL
+        }
+        right_fillers = {
+            i for i, (line, tag) in enumerate(
+                zip(diff_result.right_lines, diff_result.right_line_tags)
+            )
+            if not line and tag != DiffTag.EQUAL
+        }
+
+        left_ej.set_diff_data(
+            diff_result.left_lines, diff_result.left_line_tags,
+            left_fillers, diff_result.hunks,
+        )
+        right_ej.set_diff_data(
+            diff_result.right_lines, diff_result.right_line_tags,
+            right_fillers, diff_result.hunks,
+        )
+
+        left_ej._update_hunk_status()
+        right_ej._update_hunk_status()
+
+        self._update_ej_title("left")
+        self._update_ej_title("right")
+        self.query_one("#left-ej-panel").add_class("visible")
+        self.query_one("#right-ej-panel").add_class("visible")
+
+    def _close_ej_panel(self, side: str) -> None:
+        """EJ 패널 닫기 또는 중첩 레벨 팝."""
+        other_side = "right" if side == "left" else "left"
+        ej_stack = self._left_ej_stack if side == "left" else self._right_ej_stack
+        other_stack = self._right_ej_stack if side == "left" else self._left_ej_stack
+
+        if ej_stack:
+            this_prev = ej_stack.pop()
+            # 반대편 스택도 함께 pop하여 diff 재계산
+            if other_stack:
+                other_prev = other_stack.pop()
+                left_content = this_prev if side == "left" else other_prev
+                right_content = other_prev if side == "left" else this_prev
+                self._open_ej_with_diff(left_content, right_content)
+                self._update_ej_title(other_side)
+            else:
+                ej_editor = self.query_one(f"#{side}-ej-editor", DiffEditor)
+                lines = this_prev.split("\n") if this_prev else [""]
+                tags = [DiffTag.EQUAL] * len(lines)
+                ej_editor.set_diff_data(lines, tags, set(), [])
+            self._update_ej_title(side)
+        else:
+            # 패널 닫기 — 반대편도 함께
+            self.query_one(f"#{side}-ej-panel").remove_class("visible")
+            self.query_one(f"#{other_side}-ej-panel").remove_class("visible")
+            other_stack.clear()
+            self.query_one(f"#{side}-editor", DiffEditor).focus()
+
+    def _update_ej_title(self, side: str) -> None:
+        ej_stack = self._left_ej_stack if side == "left" else self._right_ej_stack
+        level = len(ej_stack) + 1
+        title = self.query_one(f"#{side}-ej-title", Static)
+        title.update(f"[b]Embedded JSON[/b] [dim](level {level})[/dim]")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "left-ej-close":
+            self._close_ej_panel("left")
+        elif event.button.id == "right-ej-close":
+            self._close_ej_panel("right")
 
     def key_tab(self) -> None:
         """Tab으로 좌/우 패널 전환."""
-        left = self.query_one("#left-editor", DiffEditor)
-        right = self.query_one("#right-editor", DiffEditor)
-        if self.focused is left:
-            right.focus()
+        focused = self.focused
+        fid = focused.id if focused else ""
+        if fid and fid.startswith("right"):
+            self.query_one("#left-editor", DiffEditor).focus()
         else:
-            left.focus()
+            self.query_one("#right-editor", DiffEditor).focus()
 
 
 def diff_main() -> None:

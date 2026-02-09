@@ -1,9 +1,9 @@
 """Tests for jvimdiff diff computation and DiffEditor."""
 
+import json
 from types import SimpleNamespace
 
 from jvim.diff import (
-    DiffResult,
     DiffTag,
     compute_json_diff,
     format_json,
@@ -386,3 +386,96 @@ class TestDiffEditor:
         editor._diff_hunks = []
         editor._update_hunk_status()
         assert "identical" in editor.status_msg.lower()
+
+
+class TestDiffEditorEmbeddedJson:
+    """DiffEditor EJ 기능 테스트."""
+
+    def _make_editor_with_embedded(self) -> DiffEditor:
+        """임베디드 JSON이 포함된 DiffEditor 생성."""
+        inner = json.dumps({"nested": 1}, ensure_ascii=False)
+        escaped = json.dumps(inner, ensure_ascii=False)
+        content = f'{{"data": {escaped}}}'
+        editor = DiffEditor(content)
+        return editor
+
+    def test_find_string_at_cursor(self):
+        """DiffEditor에서 임베디드 JSON 문자열을 찾을 수 있다."""
+        editor = self._make_editor_with_embedded()
+        # 포맷팅되지 않은 한 줄 JSON
+        editor.cursor_row = 0
+        editor.cursor_col = 9
+        result = editor._find_string_at_cursor()
+        assert result is not None
+        _, _, content = result
+        parsed = json.loads(content)
+        assert parsed == {"nested": 1}
+
+    def test_ej_on_diff_editor_is_readonly(self):
+        """DiffEditor는 항상 read_only."""
+        editor = self._make_editor_with_embedded()
+        assert editor.read_only is True
+
+    def test_ej_stack_push_pop(self):
+        """EJ 스택 기반 중첩 네비게이션 로직 검증."""
+        # 스택 동작은 App 레벨이므로 여기서는 스택 자체만 테스트
+        stack: list[str] = []
+        content1 = '{"level": 1}'
+        content2 = '{"level": 2}'
+
+        # 첫 번째 ej: 스택 비어있음
+        stack.append(content1)
+        assert len(stack) == 1
+
+        # 중첩 ej
+        stack.append(content2)
+        assert len(stack) == 2
+
+        # pop (닫기)
+        restored = stack.pop()
+        assert restored == content2
+        assert len(stack) == 1
+
+        restored = stack.pop()
+        assert restored == content1
+        assert len(stack) == 0
+
+    def test_ej_editor_inherits_read_only(self):
+        """EJ 패널에 사용될 DiffEditor도 read_only."""
+        ej_editor = DiffEditor("")
+        assert ej_editor.read_only is True
+
+    def test_ej_diff_editor_set_diff_data(self):
+        """EJ DiffEditor에 diff 데이터를 설정할 수 있다."""
+        ej = DiffEditor("")
+        lines = ['    "a": 1,', '    "b": 2']
+        tags = [DiffTag.EQUAL, DiffTag.REPLACE]
+        from jvim.diff import DiffHunk
+
+        hunks = [DiffHunk(1, 1, 1, 1, DiffTag.REPLACE)]
+        ej.set_diff_data(lines, tags, set(), hunks)
+        assert ej.lines == lines
+        assert ej._line_tags == tags
+        assert len(ej._diff_hunks) == 1
+        # REPLACE 행에는 배경색이 있어야 함
+        assert ej._line_background(1) == DiffEditor._DIFF_BG[DiffTag.REPLACE]
+
+    def test_ej_diff_both_sides(self):
+        """양쪽 임베디드 JSON의 diff 계산 검증."""
+        left_ej = '{\n    "key": "old_value"\n}'
+        right_ej = '{\n    "key": "new_value"\n}'
+        result = compute_json_diff(left_ej, right_ej, normalize=False)
+        # 차이가 있어야 함
+        assert len(result.hunks) > 0
+        assert len(result.left_lines) == len(result.right_lines)
+        has_change = any(
+            t in (DiffTag.REPLACE, DiffTag.DELETE, DiffTag.INSERT)
+            for t in result.left_line_tags
+        )
+        assert has_change
+
+    def test_ej_diff_identical(self):
+        """동일한 임베디드 JSON은 diff 없음."""
+        content = '{\n    "key": "value"\n}'
+        result = compute_json_diff(content, content, normalize=False)
+        assert len(result.hunks) == 0
