@@ -71,6 +71,7 @@ class JsonEditorApp(App):
         # Embedded edit state - stack of (row, col_start, col_end, parent_content, original_content)
         self._ej_stack: list[tuple[int, int, int, str, str]] = []
         self._main_was_read_only: bool = False
+        self._main_scroll_top: int = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -196,6 +197,7 @@ class JsonEditorApp(App):
                 self.notify("Embedded JSON updated", severity="information")
                 if event.quit_after:
                     self.query_one("#ej-panel").remove_class("visible")
+                    main_editor._scroll_top = self._main_scroll_top
                     main_editor.focus()
             return
 
@@ -274,6 +276,7 @@ class JsonEditorApp(App):
             self.query_one("#ej-panel").remove_class("visible")
             main_editor = self.query_one("#editor", JsonEditor)
             main_editor.read_only = self._main_was_read_only
+            main_editor._scroll_top = self._main_scroll_top
             main_editor.focus()
             return
 
@@ -290,6 +293,7 @@ class JsonEditorApp(App):
             self.query_one("#ej-panel").remove_class("visible")
             main_editor = self.query_one("#editor", JsonEditor)
             main_editor.read_only = self._main_was_read_only
+            main_editor._scroll_top = self._main_scroll_top
             main_editor.focus()
 
     def on_json_editor_embedded_edit_requested(
@@ -311,6 +315,7 @@ class JsonEditorApp(App):
             # From main editor - reset stack to level 1
             main_editor = self.query_one("#editor", JsonEditor)
             self._main_was_read_only = main_editor.read_only
+            self._main_scroll_top = main_editor._scroll_top
             main_editor.read_only = True
             self._ej_stack = [(
                 event.source_row,

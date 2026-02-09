@@ -331,6 +331,12 @@ class JsonEditor(Widget, can_focus=True):
         """Position viewport so cursor is at the top of the screen."""
         self._scroll_top = self.cursor_row
 
+    def _scroll_cursor_to_center(self, ratio: float = 0.33) -> None:
+        """Position viewport so cursor is at given ratio from top (default 1/3)."""
+        vh = self._visible_height()
+        offset = int(vh * ratio)
+        self._scroll_top = max(0, self.cursor_row - offset)
+
     # -- Public API --------------------------------------------------------
 
     def get_content(self) -> str:
@@ -1831,6 +1837,7 @@ class JsonEditor(Widget, can_focus=True):
         row, col_start, _ = self._search_matches[self._current_match]
         self.cursor_row = row
         self.cursor_col = col_start
+        self._scroll_cursor_to_center()
         total = len(self._search_matches)
         self.status_msg = f"/{self._search_pattern}  [{self._current_match + 1}/{total}]"
 

@@ -692,3 +692,30 @@ class TestLineJump:
 
         assert editor.cursor_row == 99
         assert editor._scroll_top == 99
+
+    def test_scroll_cursor_to_center(self):
+        """_scroll_cursor_to_center positions cursor at 1/3 from top."""
+        content = "\n".join([f"line {i}" for i in range(100)])
+        editor = JsonEditor(content)
+
+        editor.cursor_row = 50
+        # Simulate visible height of 30 lines
+        editor._visible_height = lambda: 30
+        editor._scroll_cursor_to_center()
+
+        # int(30 * 0.33) = 9, so scroll_top should be 50 - 9 = 41
+        assert editor._scroll_top == 41
+
+    def test_search_positions_at_center(self):
+        """Search result positions cursor at 1/3 from top."""
+        content = "\n".join([f"line {i}" for i in range(100)])
+        editor = JsonEditor(content)
+        editor._visible_height = lambda: 30
+
+        editor._search_buffer = "line 50"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert editor.cursor_row == 50
+        # int(30 * 0.33) = 9, so scroll_top should be 50 - 9 = 41
+        assert editor._scroll_top == 41
