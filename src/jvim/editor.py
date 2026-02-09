@@ -495,9 +495,11 @@ class JsonEditor(Widget, can_focus=True):
 
         if mode == EditorMode.COMMAND:
             result_append(result, f"\n:{self.command_buffer}", style="bold yellow")
+            result_append(result, " ", style="reverse")
         elif mode == EditorMode.SEARCH:
             prefix = "/" if self._search_forward else "?"
             result_append(result, f"\n{prefix}{self._search_buffer}", style="bold magenta")
+            result_append(result, " ", style="reverse")
         else:
             result_append(result, "\n")
 
@@ -1220,12 +1222,125 @@ class JsonEditor(Widget, can_focus=True):
         self._current_match = self._find_match_near_cursor()
         self._goto_current_match()
 
+    def _parse_jsonpath_filter(self, pattern: str) -> tuple[str, str, any]:
+        """Parse JSONPath with optional value filter.
+
+        Supports:
+          $.path=value    (equals)
+          $.path!=value   (not equals)
+          $.path>value    (greater than)
+          $.path<value    (less than)
+          $.path>=value   (greater or equal)
+          $.path<=value   (less or equal)
+          $.path~regex    (regex match)
+
+        Returns (path, operator, value) or (path, "", None) if no filter.
+        """
+        import re
+
+        # Order matters: check longer operators first
+        operators = ["!=", ">=", "<=", "~", "=", ">", "<"]
+        for op in operators:
+            # Find operator not inside brackets
+            idx = 0
+            bracket_depth = 0
+            while idx < len(pattern):
+                ch = pattern[idx]
+                if ch == "[":
+                    bracket_depth += 1
+                elif ch == "]":
+                    bracket_depth -= 1
+                elif bracket_depth == 0 and pattern[idx:].startswith(op):
+                    path = pattern[:idx]
+                    value_str = pattern[idx + len(op):]
+                    value = self._parse_json_value(value_str)
+                    return (path, op, value)
+                idx += 1
+
+        return (pattern, "", None)
+
+    def _parse_json_value(self, value_str: str) -> any:
+        """Parse a value string into Python object."""
+        value_str = value_str.strip()
+        if not value_str:
+            return None
+
+        # Try JSON parsing first (handles strings, numbers, booleans, null)
+        try:
+            return json.loads(value_str)
+        except json.JSONDecodeError:
+            pass
+
+        # Handle single-quoted strings
+        if len(value_str) >= 2 and value_str[0] == "'" and value_str[-1] == "'":
+            return value_str[1:-1]
+
+        # Unquoted string - treat as string
+        return value_str
+
+    def _jsonpath_value_matches(self, actual: any, op: str, expected: any) -> bool:
+        """Check if actual value matches the expected value with given operator."""
+        import re
+
+        if op == "=" or op == "==":
+            return actual == expected
+        elif op == "!=":
+            return actual != expected
+        elif op == ">":
+            try:
+                return actual > expected
+            except TypeError:
+                return False
+        elif op == "<":
+            try:
+                return actual < expected
+            except TypeError:
+                return False
+        elif op == ">=":
+            try:
+                return actual >= expected
+            except TypeError:
+                return False
+        elif op == "<=":
+            try:
+                return actual <= expected
+            except TypeError:
+                return False
+        elif op == "~":
+            # Regex match
+            if not isinstance(actual, str):
+                actual = str(actual)
+            pattern = expected if isinstance(expected, str) else str(expected)
+            try:
+                return bool(re.search(pattern, actual))
+            except re.error:
+                return False
+        return False
+
+    def _get_value_at_path(self, data: any, path: list[str | int]) -> any:
+        """Get the value at a given path in data."""
+        current = data
+        for key in path:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            elif isinstance(current, list) and isinstance(key, int):
+                if 0 <= key < len(current):
+                    current = current[key]
+                else:
+                    return None
+            else:
+                return None
+        return current
+
     def _execute_jsonpath_search(self, path: str) -> None:
         """Execute JSONPath search and find all matches."""
         # JSONL mode: search in each record separately
         if self.jsonl:
             self._execute_jsonpath_search_jsonl(path)
             return
+
+        # Parse filter if present
+        jsonpath, op, filter_value = self._parse_jsonpath_filter(path)
 
         content = self.get_content()
         try:
@@ -1236,10 +1351,19 @@ class JsonEditor(Widget, can_focus=True):
 
         # Parse and execute JSONPath
         try:
-            results = self._jsonpath_find(data, path)
+            results = self._jsonpath_find(data, jsonpath)
         except ValueError as e:
             self.status_msg = f"Invalid JSONPath: {e}"
             return
+
+        # Filter by value if operator present
+        if op:
+            results = [
+                p for p in results
+                if self._jsonpath_value_matches(
+                    self._get_value_at_path(data, p), op, filter_value
+                )
+            ]
 
         if not results:
             self.status_msg = f"JSONPath not found: {path}"
@@ -1269,6 +1393,9 @@ class JsonEditor(Widget, can_focus=True):
 
     def _execute_jsonpath_search_jsonl(self, path: str) -> None:
         """Execute JSONPath search across JSONL records."""
+        # Parse filter if present
+        jsonpath, op, filter_value = self._parse_jsonpath_filter(path)
+
         blocks = self._split_jsonl_blocks(self.get_content())
 
         if not blocks:
@@ -1289,12 +1416,17 @@ class JsonEditor(Widget, can_focus=True):
                 continue
 
             try:
-                results = self._jsonpath_find(data, path)
+                results = self._jsonpath_find(data, jsonpath)
                 for json_path in results:
+                    # Filter by value if operator present
+                    if op:
+                        actual = self._get_value_at_path(data, json_path)
+                        if not self._jsonpath_value_matches(actual, op, filter_value):
+                            continue
                     all_results.append((block_idx, data, json_path))
             except ValueError:
                 if block_idx == 0:
-                    self.status_msg = f"Invalid JSONPath: {path}"
+                    self.status_msg = f"Invalid JSONPath: {jsonpath}"
                     self._search_matches = []
                     self._current_match = -1
                     return

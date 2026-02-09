@@ -38,7 +38,7 @@ Also available as `jvi` and `jv` shortcuts.
 
 ## JSONL Support
 
-vj provides special handling for JSON Lines (`.jsonl`) files:
+jvim provides special handling for JSON Lines (`.jsonl`) files:
 
 - **Pretty-printed editing**: Each JSONL record is automatically formatted with indentation for easy reading and editing
 - **Compact saving**: When you save, each record is minified back to a single line, preserving the JSONL format
@@ -51,7 +51,7 @@ Example: A JSONL file with two records:
 {"name": "Bob", "age": 25}
 ```
 
-Opens in vj as:
+Opens in jvim as:
 ```
 {
     "name": "Alice",
@@ -65,9 +65,56 @@ Opens in vj as:
 
 And saves back to the original compact format.
 
+## JSONPath Search
+
+jvim supports powerful JSONPath searching with value filtering.
+
+### Basic JSONPath
+
+Search patterns starting with `$.` or `$[` are automatically recognized as JSONPath:
+
+```
+/$.name              # Find the "name" field
+/$..email            # Find all "email" fields (recursive)
+/$.users[0]          # First user
+/$.users[*].name     # All user names
+```
+
+### Value Filtering
+
+You can filter search results by value using comparison operators:
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `=` | Equals | `$.status="active"` |
+| `!=` | Not equals | `$.status!=null` |
+| `>` | Greater than | `$.age>18` |
+| `<` | Less than | `$.price<100` |
+| `>=` | Greater or equal | `$.count>=5` |
+| `<=` | Less or equal | `$.count<=10` |
+| `~` | Regex match | `$.email~@gmail\.com$` |
+
+### Examples
+
+```
+/$.users[*].age>30           # Users older than 30
+/$.items[*].status="active"  # Items with active status
+/$..name~^J                  # All names starting with J
+/$.price<=1000               # Price 1000 or less
+/$.config.enabled=true       # Enabled configs
+```
+
+### Search Modifiers
+
+| Suffix | Description |
+|--------|-------------|
+| `\j` | Force JSONPath mode for ambiguous patterns |
+| `\c` | Case insensitive (for regex text search) |
+| `\C` | Case sensitive (for regex text search) |
+
 ## Embedded JSON Editing
 
-JSON files often contain escaped JSON strings as values. vj lets you edit these nested JSON structures naturally.
+JSON files often contain escaped JSON strings as values. jvim lets you edit these nested JSON structures naturally.
 
 ### How it works
 
@@ -123,7 +170,9 @@ After editing and saving, the parent is updated with the minified result.
 | `/` | Search forward |
 | `?` | Search backward |
 | `n N` | Next/previous match |
-| `$.` `$[` | JSONPath search (auto-detect) |
+| `$.path` | JSONPath search (auto-detect) |
+| `$.path=val` | JSONPath with value filter |
+| `$.path~regex` | JSONPath with regex filter |
 | `\j` | JSONPath suffix for patterns |
 | `\c \C` | Case insensitive/sensitive |
 

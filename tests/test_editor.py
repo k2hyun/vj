@@ -384,3 +384,178 @@ class TestCharWidth:
 
         assert w1 == w2 == 2
         assert '한' in editor._char_width_cache
+
+
+class TestJsonPathFilter:
+    """Tests for JSONPath search with value filtering."""
+
+    def test_parse_filter_equals_string(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter('$.name="John"')
+
+        assert path == "$.name"
+        assert op == "="
+        assert val == "John"
+
+    def test_parse_filter_equals_number(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.age=30")
+
+        assert path == "$.age"
+        assert op == "="
+        assert val == 30
+
+    def test_parse_filter_greater_than(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.age>18")
+
+        assert path == "$.age"
+        assert op == ">"
+        assert val == 18
+
+    def test_parse_filter_less_than(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.price<100")
+
+        assert path == "$.price"
+        assert op == "<"
+        assert val == 100
+
+    def test_parse_filter_greater_or_equal(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.count>=5")
+
+        assert path == "$.count"
+        assert op == ">="
+        assert val == 5
+
+    def test_parse_filter_less_or_equal(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.count<=10")
+
+        assert path == "$.count"
+        assert op == "<="
+        assert val == 10
+
+    def test_parse_filter_not_equals(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.status!=null")
+
+        assert path == "$.status"
+        assert op == "!="
+        assert val is None
+
+    def test_parse_filter_regex(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.name~^J")
+
+        assert path == "$.name"
+        assert op == "~"
+        assert val == "^J"
+
+    def test_parse_filter_no_filter(self):
+        editor = JsonEditor()
+        path, op, val = editor._parse_jsonpath_filter("$.users[*].name")
+
+        assert path == "$.users[*].name"
+        assert op == ""
+        assert val is None
+
+    def test_value_matches_equals(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches("John", "=", "John")
+        assert not editor._jsonpath_value_matches("Jane", "=", "John")
+        assert editor._jsonpath_value_matches(30, "=", 30)
+
+    def test_value_matches_not_equals(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches("Jane", "!=", "John")
+        assert not editor._jsonpath_value_matches("John", "!=", "John")
+
+    def test_value_matches_greater(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches(30, ">", 18)
+        assert not editor._jsonpath_value_matches(18, ">", 18)
+        assert not editor._jsonpath_value_matches(10, ">", 18)
+
+    def test_value_matches_less(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches(10, "<", 18)
+        assert not editor._jsonpath_value_matches(18, "<", 18)
+        assert not editor._jsonpath_value_matches(30, "<", 18)
+
+    def test_value_matches_greater_or_equal(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches(30, ">=", 18)
+        assert editor._jsonpath_value_matches(18, ">=", 18)
+        assert not editor._jsonpath_value_matches(10, ">=", 18)
+
+    def test_value_matches_less_or_equal(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches(10, "<=", 18)
+        assert editor._jsonpath_value_matches(18, "<=", 18)
+        assert not editor._jsonpath_value_matches(30, "<=", 18)
+
+    def test_value_matches_regex(self):
+        editor = JsonEditor()
+
+        assert editor._jsonpath_value_matches("John", "~", "^J")
+        assert editor._jsonpath_value_matches("Jane", "~", "^J")
+        assert not editor._jsonpath_value_matches("Mary", "~", "^J")
+        assert editor._jsonpath_value_matches("test@email.com", "~", r"@.*\.com$")
+
+    def test_search_with_equals_filter(self):
+        editor = JsonEditor('{"users": [{"name": "John"}, {"name": "Jane"}]}')
+        editor._search_buffer = '$.users[*].name="John"'
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 1
+
+    def test_search_with_greater_filter(self):
+        editor = JsonEditor('{"users": [{"age": 25}, {"age": 30}, {"age": 20}]}')
+        editor._search_buffer = "$.users[*].age>24"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 2  # 25 and 30
+
+    def test_search_with_regex_filter(self):
+        editor = JsonEditor('{"users": [{"name": "John"}, {"name": "Jane"}, {"name": "Mary"}]}')
+        editor._search_buffer = "$.users[*].name~^J"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 2  # John and Jane
+
+    def test_search_jsonl_with_filter(self):
+        content = '{"name": "John", "age": 25}\n{"name": "Jane", "age": 30}\n{"name": "Bob", "age": 20}'
+        editor = JsonEditor(content, jsonl=True)
+        editor._search_buffer = "$.age>24"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 2  # 25 and 30
+
+    def test_search_jsonl_with_regex_filter(self):
+        content = '{"name": "John"}\n{"name": "Jane"}\n{"name": "Bob"}'
+        editor = JsonEditor(content, jsonl=True)
+        editor._search_buffer = "$.name~^J"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 2  # John and Jane
+
+    def test_search_with_boolean_filter(self):
+        editor = JsonEditor('{"items": [{"active": true}, {"active": false}]}')
+        editor._search_buffer = "$.items[*].active=true"
+        editor._search_forward = True
+        editor._execute_search()
+
+        assert len(editor._search_matches) == 1
