@@ -1804,6 +1804,7 @@ class JsonEditor(Widget, can_focus=True):
         escaped = json.dumps(new_content, ensure_ascii=False)
         line = self.lines[row]
         self.lines[row] = line[:col_start] + escaped + line[col_end:]
+        self._invalidate_caches()
         self.refresh()
 
     # -- JSONL helpers -----------------------------------------------------
