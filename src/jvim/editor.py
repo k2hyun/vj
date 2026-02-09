@@ -297,6 +297,11 @@ class JsonEditor(Widget, can_focus=True):
 
     def _ensure_cursor_visible(self, avail: int) -> None:
         vh = self._visible_height()
+        # Reserve 1 row for JSONL floating header if applicable
+        if self.jsonl and self._scroll_top > 0:
+            jsonl_records = self._jsonl_records_cache
+            if jsonl_records and jsonl_records[self._scroll_top] == 0:
+                vh -= 1
 
         if self.cursor_row < self._scroll_top:
             self._scroll_top = self.cursor_row
@@ -311,6 +316,13 @@ class JsonEditor(Widget, can_focus=True):
         while rows_before + cursor_dy >= vh and self._scroll_top <= self.cursor_row:
             rows_before -= self._wrap_rows(self.lines[self._scroll_top], avail)
             self._scroll_top += 1
+            # Re-check floating header after scroll
+            if self.jsonl and self._scroll_top > 0:
+                jsonl_records = self._jsonl_records_cache
+                if jsonl_records and jsonl_records[self._scroll_top] == 0:
+                    vh = self._visible_height() - 1
+                else:
+                    vh = self._visible_height()
 
     # -- Public API --------------------------------------------------------
 
