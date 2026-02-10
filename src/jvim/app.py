@@ -95,9 +95,12 @@ class JsonEditorApp(App):
     def on_mount(self) -> None:
         self._update_title()
         # Load history
+        editor = self.query_one("#editor", JsonEditor)
         history = _load_history()
-        self.query_one("#editor", JsonEditor).set_history(history)
-        self.query_one("#editor").focus()
+        editor.set_history(history)
+        # 1-depth 기준으로 자동 fold
+        editor._fold_at_depth(1)
+        editor.focus()
 
     def _update_title(self) -> None:
         ro = " [RO]" if self.read_only else ""

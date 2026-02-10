@@ -29,6 +29,33 @@ class SyncJsonEditor(JsonEditor):
             return
         super()._ensure_cursor_visible(avail)
 
+    def _sync_folds_to_target(self) -> None:
+        """fold 상태를 sync target에 복사."""
+        if self._sync_target is not None:
+            self._sync_target._folds = dict(self._folds)
+            self._sync_target._collapsed_strings = set(self._collapsed_strings)
+            self._sync_target.refresh()
+
+    def _toggle_fold(self, line_idx: int) -> None:
+        super()._toggle_fold(line_idx)
+        self._sync_folds_to_target()
+
+    def _open_fold(self, line_idx: int) -> None:
+        super()._open_fold(line_idx)
+        self._sync_folds_to_target()
+
+    def _close_fold(self, line_idx: int) -> None:
+        super()._close_fold(line_idx)
+        self._sync_folds_to_target()
+
+    def _fold_all(self) -> None:
+        super()._fold_all()
+        self._sync_folds_to_target()
+
+    def _unfold_all(self) -> None:
+        super()._unfold_all()
+        self._sync_folds_to_target()
+
     def render(self) -> Text:
         if not self.has_focus and self._sync_target is not None:
             self._scroll_top = self._sync_target._scroll_top
@@ -81,6 +108,7 @@ class DiffEditor(SyncJsonEditor):
         self.cursor_row = 0
         self.cursor_col = 0
         self._scroll_top = 0
+        self._folds.clear()
         self._invalidate_caches()
         self.refresh()
 
@@ -194,6 +222,25 @@ class JsonDiffApp(App):
                         yield Button("\u2715", id="right-ej-close", variant="error")
                     yield DiffEditor("", id="right-ej-editor")
 
+    @staticmethod
+    def _unfold_diff_regions(editor: DiffEditor) -> None:
+        """diff가 있는 라인을 포함하는 fold/collapsed string을 unfold."""
+        to_remove = []
+        for start, end in editor._folds.items():
+            for i in range(start, end + 1):
+                if i < len(editor._line_tags) and editor._line_tags[i] != DiffTag.EQUAL:
+                    to_remove.append(start)
+                    break
+        for s in to_remove:
+            del editor._folds[s]
+        # diff가 있는 collapsed string도 펼기
+        to_expand = [
+            i for i in editor._collapsed_strings
+            if i < len(editor._line_tags) and editor._line_tags[i] != DiffTag.EQUAL
+        ]
+        for i in to_expand:
+            editor._collapsed_strings.discard(i)
+
     def on_mount(self) -> None:
         left_content = Path(self.left_path).read_text(encoding="utf-8")
         right_content = Path(self.right_path).read_text(encoding="utf-8")
@@ -238,6 +285,12 @@ class JsonDiffApp(App):
         right_ej = self.query_one("#right-ej-editor", DiffEditor)
         left_ej._sync_target = right_ej
         right_ej._sync_target = left_ej
+
+        # 모든 depth fold 후 diff 있는 부분만 unfold
+        left_editor._fold_all_nested()
+        self._unfold_diff_regions(left_editor)
+        right_editor._folds = dict(left_editor._folds)
+        right_editor._collapsed_strings = set(left_editor._collapsed_strings)
 
         left_editor._update_hunk_status()
         right_editor._update_hunk_status()

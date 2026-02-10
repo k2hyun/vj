@@ -714,3 +714,372 @@ class TestLineJump:
         assert editor.cursor_row == 50
         # int(30 * 0.33) = 9, so scroll_top should be 50 - 9 = 41
         assert editor._scroll_top == 41
+
+
+class TestFolding:
+    """JSON folding 테스트."""
+
+    SAMPLE = '{\n    "a": {\n        "b": 1,\n        "c": 2\n    },\n    "d": [\n        1,\n        2\n    ],\n    "e": 3\n}'
+    # line 0: {
+    # line 1:     "a": {
+    # line 2:         "b": 1,
+    # line 3:         "c": 2
+    # line 4:     },
+    # line 5:     "d": [
+    # line 6:         1,
+    # line 7:         2
+    # line 8:     ],
+    # line 9:     "e": 3
+    # line 10: }
+
+    def test_find_foldable_at_object(self):
+        """multi-line object를 감지."""
+        editor = JsonEditor(self.SAMPLE)
+        rng = editor._find_foldable_at(1)
+        assert rng == (1, 4)
+
+    def test_find_foldable_at_array(self):
+        """multi-line array를 감지."""
+        editor = JsonEditor(self.SAMPLE)
+        rng = editor._find_foldable_at(5)
+        assert rng == (5, 8)
+
+    def test_find_foldable_at_root(self):
+        """root object를 감지."""
+        editor = JsonEditor(self.SAMPLE)
+        rng = editor._find_foldable_at(0)
+        assert rng == (0, 10)
+
+    def test_find_foldable_at_non_foldable(self):
+        """fold 불가한 라인은 None."""
+        editor = JsonEditor(self.SAMPLE)
+        assert editor._find_foldable_at(2) is None
+        assert editor._find_foldable_at(9) is None
+
+    def test_find_foldable_at_single_line(self):
+        """single-line object는 fold 불가."""
+        editor = JsonEditor('{"a": 1}')
+        assert editor._find_foldable_at(0) is None
+
+    def test_toggle_fold(self):
+        """za: fold 토글."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._toggle_fold(1)
+        assert 1 in editor._folds
+        assert editor._folds[1] == 4
+        editor._toggle_fold(1)
+        assert 1 not in editor._folds
+
+    def test_toggle_fold_inside_folded(self):
+        """za: fold 안에서 호출하면 해당 fold 펼기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor._toggle_fold(3)  # fold 안의 라인
+        assert 1 not in editor._folds
+
+    def test_close_fold_from_inside(self):
+        """zc: 블록 안에서 호출하면 감싸는 블록을 접는다."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._close_fold(3)  # "c": 2 라인
+        assert 1 in editor._folds
+        assert editor._folds[1] == 4
+
+    def test_fold_all(self):
+        """zM: top-level foldable 영역만 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_all()
+        # root만 접혀야 함 (top-level)
+        assert 0 in editor._folds
+        assert editor._folds[0] == 10
+
+    def test_unfold_all(self):
+        """zR: 모든 fold 해제."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor._folds[5] = 8
+        editor._unfold_all()
+        assert editor._folds == {}
+
+    def test_is_line_folded(self):
+        """fold 안에 숨겨진 라인 판별."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        assert not editor._is_line_folded(0)
+        assert not editor._is_line_folded(1)  # 헤더는 보임
+        assert editor._is_line_folded(2)
+        assert editor._is_line_folded(3)
+        assert editor._is_line_folded(4)
+        assert not editor._is_line_folded(5)
+
+    def test_next_visible_line(self):
+        """fold를 건너뛰는 라인 이동."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        assert editor._next_visible_line(0, 1) == 1  # 헤더는 보임
+        assert editor._next_visible_line(1, 1) == 5  # fold 건너뜀
+        assert editor._next_visible_line(5, -1) == 1  # 역방향
+
+    def test_unfold_for_line(self):
+        """검색 시 자동 펼기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor._unfold_for_line(3)
+        assert 1 not in editor._folds
+
+    def test_clamp_cursor_snaps_to_fold_header(self):
+        """fold 안에 커서가 있으면 fold 헤더로 snap."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor.cursor_row = 3
+        editor._clamp_cursor()
+        assert editor.cursor_row == 1
+
+    def test_auto_expand_fold_on_cursor_past_end(self):
+        """fold 헤더에서 커서가 라인 끝을 넘으면 자동 펼기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor.cursor_row = 1
+        # line 1: '    "a": {' — 마지막 문자 인덱스 = 9
+        line_len = len(editor.lines[1])
+        editor.cursor_col = line_len  # 끝을 넘어감
+        editor._clamp_cursor()
+        assert 1 not in editor._folds  # 자동 펼기됨
+
+    def test_no_expand_fold_on_cursor_at_end(self):
+        """fold 헤더에서 커서가 마지막 문자에 있으면 접힌 상태 유지."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor.cursor_row = 1
+        line_len = len(editor.lines[1])
+        editor.cursor_col = line_len - 1  # 마지막 문자 ('{')
+        editor._clamp_cursor()
+        assert 1 in editor._folds  # 유지
+
+    def test_set_content_clears_folds(self):
+        """set_content 시 fold 초기화."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        editor.set_content('{"new": 1}')
+        assert editor._folds == {}
+
+    def test_undo_clears_folds(self):
+        """undo 시 fold 초기화."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._save_undo()
+        editor._folds[1] = 4
+        editor._undo()
+        assert editor._folds == {}
+
+    def test_find_enclosing_foldable(self):
+        """커서를 감싸는 foldable 블록 찾기."""
+        editor = JsonEditor(self.SAMPLE)
+        rng = editor._find_enclosing_foldable(3)
+        assert rng == (1, 4)
+        rng = editor._find_enclosing_foldable(7)
+        assert rng == (5, 8)
+
+    def test_fold_at_depth_1(self):
+        """1-depth foldable 블록만 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_at_depth(1)
+        # "a": { 와 "d": [ 만 접혀야 함
+        assert 1 in editor._folds  # "a": {
+        assert 5 in editor._folds  # "d": [
+        assert 0 not in editor._folds  # root는 접히면 안 됨
+        assert len(editor._folds) == 2
+
+    def test_fold_at_depth_0(self):
+        """0-depth (root)만 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_at_depth(0)
+        assert 0 in editor._folds
+        assert len(editor._folds) == 1
+
+    def test_fold_all_nested(self):
+        """모든 depth의 foldable 블록을 접기 (root 제외)."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_all_nested()
+        assert 0 not in editor._folds  # root는 접히지 않음
+        assert 1 in editor._folds  # "a": { ... }
+        assert 5 in editor._folds  # "d": [ ... ]
+        assert len(editor._folds) == 2
+
+    def test_fold_all_nested_deep(self):
+        """중첩된 구조에서 모든 depth 접기."""
+        content = '{\n    "a": {\n        "b": {\n            "c": 1\n        }\n    }\n}'
+        # line 0: {
+        # line 1:     "a": {
+        # line 2:         "b": {
+        # line 3:             "c": 1
+        # line 4:         }
+        # line 5:     }
+        # line 6: }
+        editor = JsonEditor(content)
+        editor._fold_all_nested()
+        assert 0 not in editor._folds  # root 제외
+        assert 1 in editor._folds  # depth 1
+        assert 2 in editor._folds  # depth 2
+        assert len(editor._folds) == 2
+
+    def test_skip_visible_lines_forward(self):
+        """fold를 건너뛰며 N줄 전진."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4  # line 1-4 접힘
+        # line 0 → 1(헤더) → 5 → 6 → 7 → 8 → 9
+        result = editor._skip_visible_lines(0, 4, 1)
+        assert result == 7  # 0→1→5→6→7
+
+    def test_skip_visible_lines_backward(self):
+        """fold를 건너뛰며 N줄 후진."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._folds[1] = 4
+        # line 7 → 6 → 5 → 1(헤더) → 0
+        result = editor._skip_visible_lines(7, 4, -1)
+        assert result == 0
+
+    def test_page_down_with_folds(self):
+        """Ctrl+F: fold 시 보이는 라인 기준으로 이동."""
+        content = "\n".join([f"line {i}" for i in range(50)])
+        editor = JsonEditor(content)
+        editor._visible_height = lambda: 10
+        # fold lines 5-15 (header at 5)
+        editor._folds[5] = 15
+        editor.cursor_row = 0
+
+        from types import SimpleNamespace
+        event = SimpleNamespace(key="ctrl+f", character="")
+        editor._handle_normal(event)
+
+        # 10 visible lines from 0: 0→1→2→3→4→5(header)→16→17→18→19→20
+        assert editor.cursor_row == 20
+
+    def test_page_up_with_folds(self):
+        """Ctrl+B: fold 시 보이는 라인 기준으로 이동."""
+        content = "\n".join([f"line {i}" for i in range(50)])
+        editor = JsonEditor(content)
+        editor._visible_height = lambda: 10
+        editor._folds[5] = 15
+        editor.cursor_row = 25
+
+        from types import SimpleNamespace
+        event = SimpleNamespace(key="ctrl+b", character="")
+        editor._handle_normal(event)
+
+        # 10 visible lines back from 25: 25→24→23→22→21→20→19→18→17→16→5(header)
+        assert editor.cursor_row == 5
+
+
+class TestStringCollapse:
+    """긴 string value 접기/펼기 테스트."""
+
+    LONG_STR = "a" * 100
+    SAMPLE = '{\n    "short": "hi",\n    "long": "' + LONG_STR + '"\n}'
+    # line 0: {
+    # line 1:     "short": "hi",
+    # line 2:     "long": "aaa...aaa"
+    # line 3: }
+
+    def test_find_long_string_at(self):
+        """긴 string value를 감지."""
+        editor = JsonEditor(self.SAMPLE)
+        result = editor._find_long_string_at(2)
+        assert result is not None
+        qs, qe, slen = result
+        assert slen == 100
+
+    def test_find_long_string_at_short(self):
+        """짧은 string은 None 반환."""
+        editor = JsonEditor(self.SAMPLE)
+        assert editor._find_long_string_at(1) is None
+
+    def test_find_long_string_at_no_value(self):
+        """string value가 없는 라인은 None."""
+        editor = JsonEditor(self.SAMPLE)
+        assert editor._find_long_string_at(0) is None
+
+    def test_toggle_collapse(self):
+        """za: 긴 string 토글."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._toggle_fold(2)
+        assert 2 in editor._collapsed_strings
+        editor._toggle_fold(2)
+        assert 2 not in editor._collapsed_strings
+
+    def test_close_collapse(self):
+        """zc: 긴 string 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._close_fold(2)
+        assert 2 in editor._collapsed_strings
+
+    def test_open_collapse(self):
+        """zo: 긴 string 펼기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._collapsed_strings.add(2)
+        editor._open_fold(2)
+        assert 2 not in editor._collapsed_strings
+
+    def test_fold_all_includes_strings(self):
+        """zM: 긴 string도 같이 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_all()
+        # root object가 fold되므로 string collapse는 안에 숨겨짐
+        # string이 보이는 상태에서 확인
+        editor._unfold_all()
+        assert editor._collapsed_strings == set()
+        # fold 없이 string만 있는 경우
+        content = '{\n    "data": "' + "x" * 100 + '"\n}'
+        editor2 = JsonEditor(content)
+        editor2._fold_all()
+        # root fold에 감싸져 있으면 string collapse가 없을 수 있음
+        # top-level에서 foldable이 아닌 라인의 긴 string은 접혀야 함
+        assert 0 in editor2._folds  # root object 접힘
+
+    def test_unfold_all_clears_strings(self):
+        """zR: collapsed strings도 해제."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._collapsed_strings.add(2)
+        editor._unfold_all()
+        assert editor._collapsed_strings == set()
+
+    def test_set_content_clears_collapsed(self):
+        """set_content 시 collapsed strings 초기화."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._collapsed_strings.add(2)
+        editor.set_content('{"a": 1}')
+        assert editor._collapsed_strings == set()
+
+    def test_fold_at_depth_collapses_strings(self):
+        """_fold_at_depth에서 해당 depth의 긴 string도 접기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._fold_at_depth(1)
+        assert 2 in editor._collapsed_strings
+
+    def test_threshold(self):
+        """threshold 미만이면 접지 않음."""
+        short_str = "b" * 59  # 59 < 60 threshold
+        content = '{\n    "key": "' + short_str + '"\n}'
+        editor = JsonEditor(content)
+        assert editor._find_long_string_at(1) is None
+        # 정확히 threshold
+        exact_str = "c" * 60
+        content2 = '{\n    "key": "' + exact_str + '"\n}'
+        editor2 = JsonEditor(content2)
+        result = editor2._find_long_string_at(1)
+        assert result is not None
+
+    def test_auto_expand_on_cursor_enter(self):
+        """커서가 collapsed 영역 안으로 진입하면 자동 펼기."""
+        editor = JsonEditor(self.SAMPLE)
+        editor._collapsed_strings.add(2)
+        editor.cursor_row = 2
+        # 미리보기 영역 안 — 접힌 상태 유지
+        info = editor._find_long_string_at(2)
+        qs = info[0]
+        editor.cursor_col = qs + 5  # 미리보기 범위 안
+        editor._clamp_cursor()
+        assert 2 in editor._collapsed_strings
+        # 미리보기 끝을 넘어가면 자동 펼기
+        editor._collapsed_strings.add(2)
+        editor.cursor_col = qs + 22  # 여는 따옴표 + 20 + 1 = 넘침
+        editor._clamp_cursor()
+        assert 2 not in editor._collapsed_strings

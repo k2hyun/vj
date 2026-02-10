@@ -11,7 +11,7 @@ from jvim.diff import (
     normalize_json,
     normalize_jsonl,
 )
-from jvim.diff_app import DiffEditor
+from jvim.diff_app import DiffEditor, JsonDiffApp, SyncJsonEditor
 
 
 class TestFormatJson:
@@ -479,3 +479,155 @@ class TestDiffEditorEmbeddedJson:
         content = '{\n    "key": "value"\n}'
         result = compute_json_diff(content, content, normalize=False)
         assert len(result.hunks) == 0
+
+
+class TestDiffFoldSync:
+    """diff 뷰어에서 fold 동기화 테스트."""
+
+    SAMPLE = '{\n    "a": {\n        "b": 1\n    },\n    "c": 2\n}'
+
+    def test_sync_toggle_fold(self):
+        """한쪽에서 fold하면 다른 쪽도 동기화."""
+        left = SyncJsonEditor(self.SAMPLE)
+        right = SyncJsonEditor(self.SAMPLE)
+        left._sync_target = right
+        right._sync_target = left
+
+        left._toggle_fold(1)
+        assert 1 in left._folds
+        assert 1 in right._folds
+        assert right._folds[1] == left._folds[1]
+
+    def test_sync_unfold_all(self):
+        """전체 펼기 동기화."""
+        left = SyncJsonEditor(self.SAMPLE)
+        right = SyncJsonEditor(self.SAMPLE)
+        left._sync_target = right
+        right._sync_target = left
+
+        left._fold_all()
+        assert len(right._folds) > 0
+        left._unfold_all()
+        assert right._folds == {}
+
+    def test_set_diff_data_clears_folds(self):
+        """set_diff_data 시 fold 초기화."""
+        editor = DiffEditor(self.SAMPLE)
+        editor._folds[1] = 3
+        editor.set_diff_data(
+            lines=["a", "b"],
+            tags=[DiffTag.EQUAL, DiffTag.EQUAL],
+            filler_rows=set(),
+            hunks=[],
+        )
+        assert editor._folds == {}
+
+    def test_unfold_diff_regions(self):
+        """diff가 있는 fold 영역만 자동으로 unfold."""
+        content = json.dumps({"a": {"x": 1}, "b": {"y": 2}, "c": {"z": 3}}, indent=4)
+        editor = DiffEditor(content)
+        # EQUAL 태그로 초기화하되 b 블록에 REPLACE 태그 삽입
+        lines = content.split("\n")
+        tags = [DiffTag.EQUAL] * len(lines)
+        # "b" 블록의 라인을 찾아서 REPLACE 태그 설정
+        for i, line in enumerate(lines):
+            if '"b"' in line or '"y"' in line:
+                tags[i] = DiffTag.REPLACE
+        editor._line_tags = tags
+        # 전체 fold
+        editor._fold_all()
+        folded_before = dict(editor._folds)
+        assert len(folded_before) > 0
+
+        # diff 영역 unfold
+        JsonDiffApp._unfold_diff_regions(editor)
+
+        # b 블록의 fold는 제거되어야 함
+        for start, end in folded_before.items():
+            has_diff = any(
+                tags[i] != DiffTag.EQUAL for i in range(start, end + 1) if i < len(tags)
+            )
+            if has_diff:
+                assert start not in editor._folds, f"fold at {start} should be unfolded (has diff)"
+            else:
+                assert start in editor._folds, f"fold at {start} should remain folded"
+
+    def test_unfold_diff_regions_all_equal(self):
+        """모든 라인이 EQUAL이면 fold 유지."""
+        content = json.dumps({"a": {"x": 1}, "b": {"y": 2}}, indent=4)
+        editor = DiffEditor(content)
+        tags = [DiffTag.EQUAL] * len(content.split("\n"))
+        editor._line_tags = tags
+        editor._fold_all()
+        folds_before = dict(editor._folds)
+        JsonDiffApp._unfold_diff_regions(editor)
+        assert editor._folds == folds_before
+
+    def test_nested_fold_preserves_clean_siblings(self):
+        """diff가 있는 depth-1 블록을 열어도, 안쪽 diff 없는 블록은 접힌 상태 유지."""
+        # "a" 블록에 diff가 있지만 "a.inner"에는 없음
+        content = json.dumps({
+            "a": {"inner": {"x": 1, "y": 2}, "changed": "val"},
+            "b": {"clean": {"z": 3}},
+        }, indent=4)
+        lines = content.split("\n")
+        tags = [DiffTag.EQUAL] * len(lines)
+        # "changed" 라인에만 REPLACE
+        for i, line in enumerate(lines):
+            if '"changed"' in line:
+                tags[i] = DiffTag.REPLACE
+        editor = DiffEditor(content)
+        editor._line_tags = tags
+        # 모든 depth fold
+        editor._fold_all_nested()
+        # "a"의 inner 블록과 "b"의 clean 블록도 접혀 있어야 함
+        inner_folds = {s for s in editor._folds if s > 0}
+        assert len(inner_folds) >= 2  # 최소 depth-1 2개 + depth-2 블록들
+
+        # diff unfold
+        JsonDiffApp._unfold_diff_regions(editor)
+
+        # "b" 블록은 diff 없으므로 접힌 상태
+        b_start = None
+        for i, line in enumerate(lines):
+            if '"b"' in line and '{' in line:
+                b_start = i
+                break
+        assert b_start is not None
+        assert b_start in editor._folds, "diff 없는 b 블록은 접힌 상태 유지"
+
+        # "a.inner" 블록도 diff 없으므로 접힌 상태
+        inner_start = None
+        for i, line in enumerate(lines):
+            if '"inner"' in line and '{' in line:
+                inner_start = i
+                break
+        assert inner_start is not None
+        assert inner_start in editor._folds, "diff 없는 inner 블록은 접힌 상태 유지"
+
+    def test_unfold_diff_expands_collapsed_strings(self):
+        """diff가 있는 collapsed string은 자동 펼기."""
+        long_str = "a" * 100
+        content = '{\n    "data": "' + long_str + '"\n}'
+        editor = DiffEditor(content)
+        lines = content.split("\n")
+        tags = [DiffTag.EQUAL] * len(lines)
+        tags[1] = DiffTag.REPLACE  # "data" 라인에 diff
+        editor._line_tags = tags
+        editor._collapsed_strings.add(1)
+
+        JsonDiffApp._unfold_diff_regions(editor)
+        assert 1 not in editor._collapsed_strings
+
+    def test_unfold_diff_keeps_clean_collapsed_strings(self):
+        """diff가 없는 collapsed string은 접힌 상태 유지."""
+        long_str = "a" * 100
+        content = '{\n    "data": "' + long_str + '"\n}'
+        editor = DiffEditor(content)
+        lines = content.split("\n")
+        tags = [DiffTag.EQUAL] * len(lines)
+        editor._line_tags = tags
+        editor._collapsed_strings.add(1)
+
+        JsonDiffApp._unfold_diff_regions(editor)
+        assert 1 in editor._collapsed_strings

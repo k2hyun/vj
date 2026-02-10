@@ -135,6 +135,10 @@ class JsonEditor(Widget, can_focus=True):
         self._cache_dirty: bool = False
         self._jsonl_records_cache: list[int] | None = None
         self._char_width_cache: dict[str, int] = {}
+        # Fold state
+        self._folds: dict[int, int] = {}  # {fold_header_line: fold_end_line}
+        self._collapsed_strings: set[int] = set()  # 접힌 긴 string 라인
+        self._string_collapse_threshold: int = 60  # 이 길이 이상의 string value를 접기 대상으로
 
     # -- Helpers -----------------------------------------------------------
 
@@ -185,6 +189,28 @@ class JsonEditor(Widget, can_focus=True):
 
     def _clamp_cursor(self) -> None:
         self.cursor_row = max(0, min(self.cursor_row, len(self.lines) - 1))
+        # fold 안이면 fold 헤더로 snap
+        if self._folds and self._is_line_folded(self.cursor_row):
+            for start, end in self._folds.items():
+                if start < self.cursor_row <= end:
+                    self.cursor_row = start
+                    break
+        # collapsed string에서 커서가 숨겨진 영역에 진입하면 자동 펼기
+        row = self.cursor_row
+        if row in self._collapsed_strings:
+            info = self._find_long_string_at(row)
+            if info:
+                qs, _qe, _slen = info
+                # 미리보기 끝 위치: 여는 따옴표 + preview 문자수
+                visible_end = qs + 1 + min(20, _qe - qs - 2)
+                if self.cursor_col > visible_end:
+                    self._collapsed_strings.discard(row)
+        # fold 헤더에서 커서가 라인 끝을 넘으려 하면 자동 펼기
+        if row in self._folds:
+            line_len_here = len(self.lines[row])
+            max_here = max(0, line_len_here - 1) if line_len_here else 0
+            if self.cursor_col > max_here:
+                del self._folds[row]
         line_len = len(self.lines[self.cursor_row])
         if self._mode == EditorMode.NORMAL:
             max_col = max(0, line_len - 1) if line_len else 0
@@ -314,15 +340,18 @@ class JsonEditor(Widget, can_focus=True):
 
         wrap_rows = self._wrap_rows
         lines = self.lines
+        is_folded = self._is_line_folded if self._folds else None
         rows_before = sum(
             wrap_rows(lines[i], avail)
             for i in range(self._scroll_top, self.cursor_row)
+            if not (is_folded and is_folded(i))
         )
         cursor_dy = self._cursor_wrap_dy(
             lines[self.cursor_row], self.cursor_col, avail
         )
         while rows_before + cursor_dy >= vh and self._scroll_top <= self.cursor_row:
-            rows_before -= wrap_rows(lines[self._scroll_top], avail)
+            if not (is_folded and is_folded(self._scroll_top)):
+                rows_before -= wrap_rows(lines[self._scroll_top], avail)
             self._scroll_top += 1
             vh = _effective_vh(self._scroll_top)
 
@@ -347,6 +376,8 @@ class JsonEditor(Widget, can_focus=True):
         self.lines = content.split("\n") if content else [""]
         self.cursor_row = 0
         self.cursor_col = 0
+        self._folds.clear()
+        self._collapsed_strings.clear()
         self._invalidate_caches()
         self.refresh()
 
@@ -430,9 +461,49 @@ class JsonEditor(Widget, can_focus=True):
                     result_append(result, " " * (width - len(header)) + "\n")
                     rows_used += 1
 
+        folds = self._folds
+        collapsed_strs = self._collapsed_strings
         while rows_used < content_height and line_idx < num_lines:
+            # 접힌 라인 스킵
+            if folds and self._is_line_folded(line_idx):
+                line_idx += 1
+                continue
+
             line = lines[line_idx]
             is_cursor_line = line_idx == cursor_row
+            is_fold_header = line_idx in folds
+
+            # Collapsed string: 라인을 잘라서 표시
+            str_collapse_info = None
+            if line_idx in collapsed_strs:
+                info = self._find_long_string_at(line_idx)
+                if info:
+                    qs, qe, slen = info
+                    # 미리보기: 처음 20자 + ...
+                    preview_len = min(20, qe - qs - 2)
+                    # raw string에서 미리보기 추출 (따옴표 안쪽)
+                    preview = line[qs + 1:qs + 1 + preview_len]
+                    suffix = f'..." ({slen} chars)'
+                    # 접힌 라인: key 부분 + "preview..." (N chars) + trailing
+                    collapsed_line = line[:qs] + '"' + preview + suffix + line[qe:]
+                    collapsed_styles = compute_styles(collapsed_line)
+                    # suffix 부분을 dim italic으로 변경
+                    suffix_start = qs + 1 + preview_len
+                    for ci in range(suffix_start, suffix_start + len(suffix)):
+                        if ci < len(collapsed_styles):
+                            collapsed_styles[ci] = "dim italic"
+                    str_collapse_info = (collapsed_line, collapsed_styles)
+
+            if str_collapse_info:
+                line, line_styles = str_collapse_info
+            else:
+                # Use cached styles or compute
+                if line_idx in style_cache:
+                    line_styles = style_cache[line_idx]
+                else:
+                    line_styles = compute_styles(line)
+                    style_cache[line_idx] = line_styles
+
             line_len = len(line)
 
             # Break line into width-aware wrapped segments
@@ -443,13 +514,6 @@ class JsonEditor(Widget, can_focus=True):
                 last_w = sum(char_width(line[c]) for c in range(ls, le))
                 if last_w + 1 > avail:
                     segs.append((line_len, line_len))
-
-            # Use cached styles or compute
-            if line_idx in style_cache:
-                line_styles = style_cache[line_idx]
-            else:
-                line_styles = compute_styles(line)
-                style_cache[line_idx] = line_styles
 
             # 라인 배경 (diff 하이라이팅 등 서브클래스용 훅)
             line_bg = self._line_background(line_idx)
@@ -466,6 +530,10 @@ class JsonEditor(Widget, can_focus=True):
                         style = "black on yellow" if is_current else "black on dark_goldenrod"
                         for c in range(m_start, min(m_end, line_len)):
                             line_styles[c] = style
+
+            # Collapsed string은 1줄만 렌더 (wrap 방지)
+            if str_collapse_info:
+                segs = segs[:1]
 
             for si, (s_start, s_end) in enumerate(segs):
                 if rows_used >= content_height:
@@ -497,12 +565,19 @@ class JsonEditor(Widget, can_focus=True):
                 # Cursor block at end of line (insert mode)
                 if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
                     result_append(result, " ", style="reverse")
+                # Fold summary 표시
+                fold_summary_w = 0
+                if is_fold_header and si == 0:
+                    hidden = folds[line_idx] - line_idx
+                    summary = f" ... ({hidden} lines)"
+                    fold_summary_w = len(summary)
+                    result_append(result, summary, style="dim italic")
                 # 라인 배경이 있으면 나머지 너비를 배경색으로 채움
                 if line_bg:
                     seg_w = sum(char_width(line[c]) for c in range(s_start, s_end))
                     if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
                         seg_w += 1
-                    pad = avail - seg_w
+                    pad = avail - seg_w - fold_summary_w
                     if pad > 0:
                         result_append(result, " " * pad, style=line_bg)
                 result_append(result, "\n")
@@ -658,9 +733,9 @@ class JsonEditor(Widget, can_focus=True):
         if char == "h" or key == "left":
             self.cursor_col -= 1
         elif char == "j" or key == "down":
-            self.cursor_row += 1
+            self.cursor_row = self._next_visible_line(self.cursor_row, 1) if self._folds else self.cursor_row + 1
         elif char == "k" or key == "up":
-            self.cursor_row -= 1
+            self.cursor_row = self._next_visible_line(self.cursor_row, -1) if self._folds else self.cursor_row - 1
         elif char == "l" or key == "right":
             self.cursor_col += 1
         elif char == "w":
@@ -680,19 +755,31 @@ class JsonEditor(Widget, can_focus=True):
         elif char == "%":
             self._jump_matching_bracket()
         elif key == "pagedown" or key == "ctrl+f":
-            self.cursor_row += self._visible_height()
+            if self._folds:
+                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height(), 1)
+            else:
+                self.cursor_row += self._visible_height()
         elif key == "pageup" or key == "ctrl+b":
-            self.cursor_row -= self._visible_height()
+            if self._folds:
+                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height(), -1)
+            else:
+                self.cursor_row -= self._visible_height()
         elif key == "ctrl+d":
-            self.cursor_row += self._visible_height() // 2
+            if self._folds:
+                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height() // 2, 1)
+            else:
+                self.cursor_row += self._visible_height() // 2
         elif key == "ctrl+u":
-            self.cursor_row -= self._visible_height() // 2
+            if self._folds:
+                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height() // 2, -1)
+            else:
+                self.cursor_row -= self._visible_height() // 2
         elif key == "ctrl+e":
-            self._scroll_top = min(
-                self._scroll_top + 1, len(self.lines) - 1
-            )
+            nxt = self._next_visible_line(self._scroll_top, 1) if self._folds else self._scroll_top + 1
+            self._scroll_top = min(nxt, len(self.lines) - 1)
         elif key == "ctrl+y":
-            self._scroll_top = max(self._scroll_top - 1, 0)
+            prev = self._next_visible_line(self._scroll_top, -1) if self._folds else self._scroll_top - 1
+            self._scroll_top = max(prev, 0)
         elif key == "ctrl+g":
             total = len(self.lines)
             pct = (self.cursor_row + 1) * 100 // total if total else 0
@@ -797,11 +884,11 @@ class JsonEditor(Widget, can_focus=True):
                 self._dot_replay()
 
         # multi-key starters
-        elif char in ("d", "c", "y", "r", "g", "e"):
-            if self.read_only and char not in ("y", "g", "e"):
+        elif char in ("d", "c", "y", "r", "g", "e", "z"):
+            if self.read_only and char not in ("y", "g", "e", "z"):
                 self.status_msg = "[readonly]"
             else:
-                if char not in ("y", "g", "e"):
+                if char not in ("y", "g", "e", "z"):
                     self._dot_start(event)
                 self.pending = char
 
@@ -909,6 +996,18 @@ class JsonEditor(Widget, can_focus=True):
 
         elif combo == "ej":
             self._edit_embedded_json()
+
+        # fold 명령어
+        elif combo == "za":
+            self._toggle_fold(self.cursor_row)
+        elif combo == "zo":
+            self._open_fold(self.cursor_row)
+        elif combo == "zc":
+            self._close_fold(self.cursor_row)
+        elif combo == "zM":
+            self._fold_all()
+        elif combo == "zR":
+            self._unfold_all()
 
         else:
             self._dot_stop()
@@ -1842,6 +1941,7 @@ class JsonEditor(Widget, can_focus=True):
             return
 
         row, col_start, _ = self._search_matches[self._current_match]
+        self._unfold_for_line(row)
         self.cursor_row = row
         self.cursor_col = col_start
         self._scroll_cursor_to_center()
@@ -1940,6 +2040,8 @@ class JsonEditor(Widget, can_focus=True):
             self.lines = formatted.split("\n")
             self.cursor_row = 0
             self.cursor_col = 0
+            self._folds.clear()
+            self._collapsed_strings.clear()
             self.status_msg = "formatted"
         except json.JSONDecodeError as e:
             self.status_msg = f"cannot format: {e.msg} (line {e.lineno})"
@@ -2168,6 +2270,208 @@ class JsonEditor(Widget, can_focus=True):
             if row >= 0:
                 col = len(self.lines[row]) - 1
 
+    # -- Folding -----------------------------------------------------------
+
+    def _find_matching_bracket_forward(self, row: int, col: int) -> tuple[int, int] | None:
+        """_search_bracket_forward와 동일하나 커서를 변경하지 않고 위치만 반환."""
+        line = self.lines[row]
+        if col >= len(line):
+            return None
+        open_ch = line[col]
+        close_ch = self._BRACKET_PAIRS.get(open_ch)
+        if close_ch is None:
+            return None
+        depth = 1
+        r, c = row, col + 1
+        while r < len(self.lines):
+            ln = self.lines[r]
+            while c < len(ln):
+                if ln[c] == open_ch:
+                    depth += 1
+                elif ln[c] == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return (r, c)
+                c += 1
+            r += 1
+            c = 0
+        return None
+
+    def _find_foldable_at(self, line_idx: int) -> tuple[int, int] | None:
+        """line_idx에서 시작하는 fold 가능 범위를 반환. 없으면 None."""
+        line = self.lines[line_idx]
+        stripped = line.rstrip()
+        if not stripped:
+            return None
+        last_ch = stripped[-1]
+        if last_ch in ("{", "["):
+            col = len(stripped) - 1
+            match = self._find_matching_bracket_forward(line_idx, col)
+            if match and match[0] > line_idx:
+                return (line_idx, match[0])
+        return None
+
+    def _find_enclosing_foldable(self, line_idx: int) -> tuple[int, int] | None:
+        """line_idx를 감싸는 가장 가까운 foldable 블록의 시작줄을 찾는다."""
+        for i in range(line_idx - 1, -1, -1):
+            rng = self._find_foldable_at(i)
+            if rng and rng[0] < line_idx <= rng[1]:
+                return rng
+        return None
+
+    def _is_line_folded(self, line_idx: int) -> bool:
+        """fold 안에 숨겨진 라인인지 확인."""
+        for start, end in self._folds.items():
+            if start < line_idx <= end:
+                return True
+        return False
+
+    def _next_visible_line(self, line_idx: int, direction: int = 1) -> int:
+        """다음/이전 보이는 라인 인덱스 반환."""
+        idx = line_idx + direction
+        while 0 <= idx < len(self.lines):
+            if not self._is_line_folded(idx):
+                return idx
+            idx += direction
+        return line_idx
+
+    def _skip_visible_lines(self, line_idx: int, count: int, direction: int = 1) -> int:
+        """보이는 라인 기준으로 count만큼 이동."""
+        idx = line_idx
+        for _ in range(count):
+            nxt = self._next_visible_line(idx, direction)
+            if nxt == idx:
+                break
+            idx = nxt
+        return idx
+
+    def _unfold_for_line(self, line_idx: int) -> None:
+        """line_idx를 숨기고 있는 fold를 모두 해제."""
+        to_remove = [s for s, e in self._folds.items() if s < line_idx <= e]
+        for s in to_remove:
+            del self._folds[s]
+
+    def _find_long_string_at(self, line_idx: int) -> tuple[int, int, int] | None:
+        """라인에서 긴 string value를 찾는다.
+
+        Returns (quote_start, quote_end, str_len) 또는 None.
+        quote_start/end는 따옴표 포함 위치.
+        """
+        line = self.lines[line_idx]
+        # ':' 뒤의 string value를 찾기
+        i = 0
+        while i < len(line):
+            if line[i] == '"':
+                start = i
+                i += 1
+                while i < len(line):
+                    if line[i] == '"' and line[i - 1] != '\\':
+                        break
+                    i += 1
+                end = i + 1  # 닫는 따옴표 포함
+                before = line[:start].rstrip()
+                if before.endswith(':'):
+                    str_len = end - start - 2  # 따옴표 제외 실제 문자열 길이
+                    if str_len >= self._string_collapse_threshold:
+                        return (start, end, str_len)
+            i += 1
+        return None
+
+    def _toggle_fold(self, line_idx: int) -> None:
+        """za: fold 토글. bracket fold 또는 string collapse."""
+        # bracket fold 토글
+        if line_idx in self._folds:
+            del self._folds[line_idx]
+            return
+        rng = self._find_foldable_at(line_idx)
+        if rng:
+            self._folds[rng[0]] = rng[1]
+            return
+        # 커서가 fold 안이면 해당 fold 펼기
+        for start, end in list(self._folds.items()):
+            if start < line_idx <= end:
+                del self._folds[start]
+                return
+        # string collapse 토글
+        if line_idx in self._collapsed_strings:
+            self._collapsed_strings.discard(line_idx)
+            return
+        if self._find_long_string_at(line_idx):
+            self._collapsed_strings.add(line_idx)
+
+    def _open_fold(self, line_idx: int) -> None:
+        """zo: fold 열기."""
+        if line_idx in self._folds:
+            del self._folds[line_idx]
+        self._collapsed_strings.discard(line_idx)
+
+    def _close_fold(self, line_idx: int) -> None:
+        """zc: fold 접기. 커서가 블록 안이면 해당 블록의 시작줄을 접는다."""
+        rng = self._find_foldable_at(line_idx)
+        if rng:
+            self._folds[rng[0]] = rng[1]
+            return
+        # string collapse (enclosing foldable보다 우선)
+        if self._find_long_string_at(line_idx):
+            self._collapsed_strings.add(line_idx)
+            return
+        # 현재 줄을 감싸는 foldable 블록 찾기
+        enclosing = self._find_enclosing_foldable(line_idx)
+        if enclosing:
+            self._folds[enclosing[0]] = enclosing[1]
+            self.cursor_row = enclosing[0]
+
+    def _fold_all(self) -> None:
+        """zM: 모든 top-level foldable 영역과 긴 string 접기."""
+        self._folds.clear()
+        self._collapsed_strings.clear()
+        i = 0
+        while i < len(self.lines):
+            rng = self._find_foldable_at(i)
+            if rng:
+                self._folds[rng[0]] = rng[1]
+                i = rng[1] + 1  # 접힌 영역 건너뛰기 (top-level만)
+            else:
+                if self._find_long_string_at(i):
+                    self._collapsed_strings.add(i)
+                i += 1
+
+    def _unfold_all(self) -> None:
+        """zR: 모든 fold 해제."""
+        self._folds.clear()
+        self._collapsed_strings.clear()
+
+    def _fold_all_nested(self) -> None:
+        """모든 depth의 foldable 블록과 긴 string을 접기 (root 제외)."""
+        self._folds.clear()
+        self._collapsed_strings.clear()
+        for i in range(len(self.lines)):
+            rng = self._find_foldable_at(i)
+            if rng:
+                self._folds[rng[0]] = rng[1]
+            elif self._find_long_string_at(i):
+                self._collapsed_strings.add(i)
+        # root는 접지 않음
+        if 0 in self._folds:
+            del self._folds[0]
+
+    def _fold_at_depth(self, depth: int) -> None:
+        """지정된 depth의 foldable 블록과 긴 string을 접기."""
+        self._folds.clear()
+        self._collapsed_strings.clear()
+        target_indent = depth * 4  # indent=4 기준
+        for i, line in enumerate(self.lines):
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            indent = len(line) - len(stripped)
+            if indent == target_indent:
+                rng = self._find_foldable_at(i)
+                if rng:
+                    self._folds[rng[0]] = rng[1]
+                elif self._find_long_string_at(i):
+                    self._collapsed_strings.add(i)
+
     # -- Edit helpers ------------------------------------------------------
 
     def _delete_word(self) -> None:
@@ -2219,6 +2523,8 @@ class JsonEditor(Widget, can_focus=True):
         self.lines = lines
         self.cursor_row = row
         self.cursor_col = col
+        self._folds.clear()
+        self._collapsed_strings.clear()
         self._invalidate_caches()
         self.status_msg = "undone"
 
@@ -2232,5 +2538,7 @@ class JsonEditor(Widget, can_focus=True):
         self.lines = lines
         self.cursor_row = row
         self.cursor_col = col
+        self._folds.clear()
+        self._collapsed_strings.clear()
         self._invalidate_caches()
         self.status_msg = "redone"
