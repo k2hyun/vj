@@ -139,6 +139,11 @@ class JsonEditor(Widget, can_focus=True):
         self._folds: dict[int, int] = {}  # {fold_header_line: fold_end_line}
         self._collapsed_strings: set[int] = set()  # 접힌 긴 string 라인
         self._string_collapse_threshold: int = 60  # 이 길이 이상의 string value를 접기 대상으로
+        # Visual mode 상태
+        self._visual_mode: str = ""          # "" | "v" | "V"
+        self._visual_anchor_row: int = 0     # 선택 시작 row
+        self._visual_anchor_col: int = 0     # 선택 시작 col (v 모드용)
+        self._yank_type: str = "line"        # "line" | "char" — paste 동작 결정
 
     # -- Helpers -----------------------------------------------------------
 
@@ -518,12 +523,33 @@ class JsonEditor(Widget, can_focus=True):
             # 라인 배경 (diff 하이라이팅 등 서브클래스용 훅)
             line_bg = self._line_background(line_idx)
             has_search = search_by_row and line_idx in search_by_row
+            has_visual = bool(self._visual_mode) and line_len > 0
             # 변이가 필요한 경우에만 복사
-            if line_bg or has_search:
+            if line_bg or has_visual or has_search:
                 line_styles = line_styles[:]
                 if line_bg:
                     for c in range(len(line_styles)):
                         line_styles[c] = f"{line_bg} {line_styles[c]}"
+                # Visual 하이라이트 (search보다 아래 — search가 위에 보이도록)
+                if has_visual:
+                    vsr, vsc, ver, vec = self._visual_selection_range()
+                    if self._visual_mode == "V":
+                        if vsr <= line_idx <= ver:
+                            for c in range(line_len):
+                                line_styles[c] = "on dark_blue"
+                    else:
+                        if vsr == ver == line_idx:
+                            for c in range(vsc, min(vec + 1, line_len)):
+                                line_styles[c] = "on dark_blue"
+                        elif line_idx == vsr:
+                            for c in range(vsc, line_len):
+                                line_styles[c] = "on dark_blue"
+                        elif line_idx == ver:
+                            for c in range(0, min(vec + 1, line_len)):
+                                line_styles[c] = "on dark_blue"
+                        elif vsr < line_idx < ver:
+                            for c in range(line_len):
+                                line_styles[c] = "on dark_blue"
                 if has_search:
                     for m_start, m_end, mi in search_by_row[line_idx]:
                         is_current = mi == self._current_match
@@ -594,8 +620,13 @@ class JsonEditor(Widget, can_focus=True):
 
         # status bar
         mode = self._mode
-        mode_label = f" {mode.name} "
-        result_append(result, mode_label, style=self._MODE_STYLE[mode])
+        if self._visual_mode:
+            mode_label = " VISUAL LINE " if self._visual_mode == "V" else " VISUAL "
+            mode_style = "bold white on dark_orange"
+        else:
+            mode_label = f" {mode.name} "
+            mode_style = self._MODE_STYLE[mode]
+        result_append(result, mode_label, style=mode_style)
 
         read_only = self.read_only
         if read_only:
@@ -725,8 +756,36 @@ class JsonEditor(Widget, can_focus=True):
         key = event.key
         char = event.character or ""
 
+        # Escape: visual mode 해제 (pending보다 우선)
+        if key == "escape" and self._visual_mode:
+            self._visual_mode = ""
+            self.status_msg = ""
+            return
+
         if self.pending:
             self._handle_pending(char, key)
+            return
+
+        # Visual mode 진입/전환/해제
+        if char == "v":
+            if self._visual_mode == "v":
+                self._visual_mode = ""
+                self.status_msg = ""
+            else:
+                self._visual_mode = "v"
+                self._visual_anchor_row = self.cursor_row
+                self._visual_anchor_col = self.cursor_col
+                self.status_msg = "-- VISUAL --"
+            return
+        if char == "V":
+            if self._visual_mode == "V":
+                self._visual_mode = ""
+                self.status_msg = ""
+            else:
+                self._visual_mode = "V"
+                self._visual_anchor_row = self.cursor_row
+                self._visual_anchor_col = self.cursor_col
+                self.status_msg = "-- VISUAL LINE --"
             return
 
         # movement
@@ -885,6 +944,10 @@ class JsonEditor(Widget, can_focus=True):
 
         # multi-key starters
         elif char in ("d", "c", "y", "r", "g", "e", "z"):
+            # Visual mode 연산자 인터셉트
+            if self._visual_mode and char in ("d", "y", "c"):
+                self._execute_visual_operator(char)
+                return
             if self.read_only and char not in ("y", "g", "e", "z"):
                 self.status_msg = "[readonly]"
             else:
@@ -894,11 +957,13 @@ class JsonEditor(Widget, can_focus=True):
 
         # search mode
         elif char == "/":
+            self._visual_mode = ""
             self._mode = EditorMode.SEARCH
             self._search_buffer = ""
             self._search_forward = True
             self.status_msg = ""
         elif char == "?":
+            self._visual_mode = ""
             self._mode = EditorMode.SEARCH
             self._search_buffer = ""
             self._search_forward = False
@@ -910,6 +975,7 @@ class JsonEditor(Widget, can_focus=True):
 
         # command mode
         elif char == ":":
+            self._visual_mode = ""
             self._mode = EditorMode.COMMAND
             self.command_buffer = ""
             self.status_msg = ""
@@ -932,6 +998,7 @@ class JsonEditor(Widget, can_focus=True):
 
         if combo == "dd":
             self._save_undo()
+            self._yank_type = "line"
             self.yank_buffer = [self.lines[self.cursor_row]]
             if len(self.lines) > 1:
                 self.lines.pop(self.cursor_row)
@@ -969,6 +1036,7 @@ class JsonEditor(Widget, can_focus=True):
 
         elif combo == "cc":
             self._save_undo()
+            self._yank_type = "line"
             indent = self._current_indent()
             self.yank_buffer = [self.lines[self.cursor_row]]
             self.lines[self.cursor_row] = " " * indent
@@ -977,6 +1045,7 @@ class JsonEditor(Widget, can_focus=True):
             # recording continues into insert mode
 
         elif combo == "yy":
+            self._yank_type = "line"
             self.yank_buffer = [self.lines[self.cursor_row]]
             self.status_msg = "line yanked"
 
@@ -2456,7 +2525,7 @@ class JsonEditor(Widget, can_focus=True):
             del self._folds[0]
 
     def _fold_at_depth(self, depth: int) -> None:
-        """지정된 depth의 foldable 블록과 긴 string을 접기."""
+        """지정된 depth의 foldable 블록을 접기."""
         self._folds.clear()
         self._collapsed_strings.clear()
         target_indent = depth * 4  # indent=4 기준
@@ -2469,8 +2538,106 @@ class JsonEditor(Widget, can_focus=True):
                 rng = self._find_foldable_at(i)
                 if rng:
                     self._folds[rng[0]] = rng[1]
-                elif self._find_long_string_at(i):
-                    self._collapsed_strings.add(i)
+
+    # -- Visual mode -------------------------------------------------------
+
+    def _visual_selection_range(self) -> tuple[int, int, int, int]:
+        """선택 범위 반환: (start_row, start_col, end_row, end_col).
+
+        V 모드: start_col=0, end_col=len(end_line)
+        v 모드: 앵커와 커서 중 작은 쪽이 start
+        """
+        ar, ac = self._visual_anchor_row, self._visual_anchor_col
+        cr, cc = self.cursor_row, self.cursor_col
+        if self._visual_mode == "V":
+            if ar <= cr:
+                return (ar, 0, cr, len(self.lines[cr]))
+            else:
+                return (cr, 0, ar, len(self.lines[ar]))
+        # char-wise "v"
+        if (ar, ac) <= (cr, cc):
+            return (ar, ac, cr, cc)
+        else:
+            return (cr, cc, ar, ac)
+
+    def _execute_visual_operator(self, op: str) -> None:
+        """Visual 선택에 대해 d/y/c 연산자 실행."""
+        if op in ("d", "c") and self._check_readonly():
+            self._visual_mode = ""
+            return
+        if self._visual_mode == "V":
+            self._execute_visual_linewise(op)
+        else:
+            self._execute_visual_charwise(op)
+        self._visual_mode = ""
+
+    def _execute_visual_linewise(self, op: str) -> None:
+        """Line-wise visual 연산자 (V 모드)."""
+        sr, _sc, er, _ec = self._visual_selection_range()
+        selected = self.lines[sr:er + 1]
+        self._yank_type = "line"
+        if op == "y":
+            self.yank_buffer = selected[:]
+            self.cursor_row = sr
+            self.cursor_col = 0
+            self.status_msg = f"{len(selected)} lines yanked"
+            return
+        # d 또는 c: 삭제
+        self._save_undo()
+        self.yank_buffer = selected[:]
+        if er < len(self.lines) - 1 or sr > 0:
+            self.lines[sr:er + 1] = []
+            if not self.lines:
+                self.lines = [""]
+        else:
+            # 전체 파일 선택 시
+            self.lines[sr:er + 1] = [""]
+        self.cursor_row = min(sr, len(self.lines) - 1)
+        self.cursor_col = 0
+        if op == "c":
+            indent = len(selected[0]) - len(selected[0].lstrip()) if selected[0].strip() else 0
+            self.lines.insert(self.cursor_row, " " * indent)
+            self.cursor_col = indent
+            self._enter_insert()
+        else:
+            self.status_msg = f"{len(selected)} lines deleted"
+
+    def _execute_visual_charwise(self, op: str) -> None:
+        """Char-wise visual 연산자 (v 모드)."""
+        sr, sc, er, ec = self._visual_selection_range()
+        self._yank_type = "char"
+        # 선택 텍스트 추출
+        if sr == er:
+            text = self.lines[sr][sc:ec + 1]
+        else:
+            parts = [self.lines[sr][sc:]]
+            for r in range(sr + 1, er):
+                parts.append(self.lines[r])
+            parts.append(self.lines[er][:ec + 1])
+            text = "\n".join(parts)
+        if op == "y":
+            self.yank_buffer = [text]
+            self.cursor_row = sr
+            self.cursor_col = sc
+            self.status_msg = "yanked"
+            return
+        # d 또는 c: 삭제
+        self._save_undo()
+        self.yank_buffer = [text]
+        if sr == er:
+            line = self.lines[sr]
+            self.lines[sr] = line[:sc] + line[ec + 1:]
+        else:
+            before = self.lines[sr][:sc]
+            after = self.lines[er][ec + 1:]
+            self.lines[sr] = before + after
+            del self.lines[sr + 1:er + 1]
+        self.cursor_row = sr
+        self.cursor_col = sc
+        if op == "c":
+            self._enter_insert()
+        else:
+            self.status_msg = "deleted"
 
     # -- Edit helpers ------------------------------------------------------
 
@@ -2490,6 +2657,25 @@ class JsonEditor(Widget, can_focus=True):
         if not self.yank_buffer:
             return
         self._save_undo()
+        if self._yank_type == "char":
+            text = self.yank_buffer[0]
+            line = self.lines[self.cursor_row]
+            insert_col = min(self.cursor_col + 1, len(line))
+            if "\n" not in text:
+                self.lines[self.cursor_row] = line[:insert_col] + text + line[insert_col:]
+                self.cursor_col = insert_col + len(text) - 1
+            else:
+                parts = text.split("\n")
+                after = line[insert_col:]
+                self.lines[self.cursor_row] = line[:insert_col] + parts[0]
+                for i, p in enumerate(parts[1:], 1):
+                    if i == len(parts) - 1:
+                        self.lines.insert(self.cursor_row + i, p + after)
+                    else:
+                        self.lines.insert(self.cursor_row + i, p)
+                self.cursor_row += len(parts) - 1
+                self.cursor_col = len(parts[-1]) - 1
+            return
         for i, line in enumerate(self.yank_buffer):
             self.lines.insert(self.cursor_row + 1 + i, line)
         self.cursor_row += 1
@@ -2499,6 +2685,25 @@ class JsonEditor(Widget, can_focus=True):
         if not self.yank_buffer:
             return
         self._save_undo()
+        if self._yank_type == "char":
+            text = self.yank_buffer[0]
+            line = self.lines[self.cursor_row]
+            insert_col = self.cursor_col
+            if "\n" not in text:
+                self.lines[self.cursor_row] = line[:insert_col] + text + line[insert_col:]
+                self.cursor_col = insert_col + len(text) - 1
+            else:
+                parts = text.split("\n")
+                after = line[insert_col:]
+                self.lines[self.cursor_row] = line[:insert_col] + parts[0]
+                for i, p in enumerate(parts[1:], 1):
+                    if i == len(parts) - 1:
+                        self.lines.insert(self.cursor_row + i, p + after)
+                    else:
+                        self.lines.insert(self.cursor_row + i, p)
+                self.cursor_row += len(parts) - 1
+                self.cursor_col = len(parts[-1]) - 1
+            return
         for i, line in enumerate(self.yank_buffer):
             self.lines.insert(self.cursor_row + i, line)
         self.cursor_col = 0
@@ -2523,6 +2728,7 @@ class JsonEditor(Widget, can_focus=True):
         self.lines = lines
         self.cursor_row = row
         self.cursor_col = col
+        self._visual_mode = ""
         self._folds.clear()
         self._collapsed_strings.clear()
         self._invalidate_caches()
@@ -2538,6 +2744,7 @@ class JsonEditor(Widget, can_focus=True):
         self.lines = lines
         self.cursor_row = row
         self.cursor_col = col
+        self._visual_mode = ""
         self._folds.clear()
         self._collapsed_strings.clear()
         self._invalidate_caches()

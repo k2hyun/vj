@@ -1083,3 +1083,323 @@ class TestStringCollapse:
         editor.cursor_col = qs + 22  # 여는 따옴표 + 20 + 1 = 넘침
         editor._clamp_cursor()
         assert 2 not in editor._collapsed_strings
+
+
+class TestVisualMode:
+    """Tests for visual mode (v/V) selection and operators."""
+
+    SAMPLE = '{\n    "name": "Alice",\n    "age": 30,\n    "items": [1, 2, 3]\n}'
+
+    def _make_editor(self, content=None):
+        editor = JsonEditor(content or self.SAMPLE)
+        return editor
+
+    def _key(self, char, key=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(key=key or char, character=char)
+
+    # -- 진입/탈출 --
+
+    def test_v_enters_visual_mode(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+
+    def test_V_enters_visual_line_mode(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("V"))
+        assert editor._visual_mode == "V"
+
+    def test_v_toggle_exits(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == ""
+
+    def test_V_toggle_exits(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("V"))
+        assert editor._visual_mode == "V"
+        editor._handle_normal(self._key("V"))
+        assert editor._visual_mode == ""
+
+    def test_v_to_V_switches(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+        editor._handle_normal(self._key("V"))
+        assert editor._visual_mode == "V"
+
+    def test_V_to_v_switches(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("V"))
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+
+    def test_escape_exits_visual(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+        editor._handle_normal(self._key(None, "escape"))
+        assert editor._visual_mode == ""
+
+    # -- 선택 범위 --
+
+    def test_selection_range_v_forward(self):
+        editor = self._make_editor()
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 1
+        editor._visual_anchor_col = 4
+        editor.cursor_row = 1
+        editor.cursor_col = 10
+        sr, sc, er, ec = editor._visual_selection_range()
+        assert (sr, sc) == (1, 4)
+        assert (er, ec) == (1, 10)
+
+    def test_selection_range_v_backward(self):
+        editor = self._make_editor()
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 1
+        editor._visual_anchor_col = 10
+        editor.cursor_row = 1
+        editor.cursor_col = 4
+        sr, sc, er, ec = editor._visual_selection_range()
+        assert (sr, sc) == (1, 4)
+        assert (er, ec) == (1, 10)
+
+    def test_selection_range_V_forward(self):
+        editor = self._make_editor()
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 2
+        sr, sc, er, ec = editor._visual_selection_range()
+        assert sr == 1
+        assert sc == 0
+        assert er == 2
+        assert ec == len(editor.lines[2])
+
+    def test_selection_range_V_backward(self):
+        editor = self._make_editor()
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 2
+        editor.cursor_row = 1
+        sr, sc, er, ec = editor._visual_selection_range()
+        assert sr == 1
+        assert er == 2
+
+    # -- yank --
+
+    def test_linewise_yank(self):
+        editor = self._make_editor()
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 2
+        editor._handle_normal(self._key("y"))
+        assert editor._visual_mode == ""
+        assert editor._yank_type == "line"
+        assert len(editor.yank_buffer) == 2
+        assert "name" in editor.yank_buffer[0]
+        assert "age" in editor.yank_buffer[1]
+
+    def test_charwise_yank(self):
+        editor = self._make_editor()
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 1
+        editor._visual_anchor_col = 5
+        editor.cursor_row = 1
+        editor.cursor_col = 10
+        editor._handle_normal(self._key("y"))
+        assert editor._visual_mode == ""
+        assert editor._yank_type == "char"
+        assert len(editor.yank_buffer) == 1
+        # 선택된 텍스트: col 5~10 inclusive
+        assert editor.yank_buffer[0] == editor.lines[1][5:11]
+
+    # -- delete --
+
+    def test_linewise_delete(self):
+        editor = self._make_editor()
+        original_lines = editor.lines[:]
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 1
+        editor._handle_normal(self._key("d"))
+        assert editor._visual_mode == ""
+        assert len(editor.lines) == len(original_lines) - 1
+        assert len(editor.undo_stack) == 1
+
+    def test_charwise_delete_single_line(self):
+        editor = self._make_editor('{"key": "value"}')
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 0
+        editor._visual_anchor_col = 1
+        editor.cursor_row = 0
+        editor.cursor_col = 4
+        editor._handle_normal(self._key("d"))
+        assert editor._visual_mode == ""
+        # "key" 부분이 삭제됨 (col 1~4 inclusive)
+        assert editor.lines[0] == '{": "value"}'
+
+    def test_charwise_delete_multi_line(self):
+        editor = self._make_editor()
+        original_count = len(editor.lines)
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 1
+        editor._visual_anchor_col = 4
+        editor.cursor_row = 2
+        editor.cursor_col = 4
+        editor._handle_normal(self._key("d"))
+        assert editor._visual_mode == ""
+        assert len(editor.lines) < original_count
+
+    def test_delete_undo(self):
+        editor = self._make_editor()
+        original_lines = editor.lines[:]
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 2
+        editor._handle_normal(self._key("d"))
+        assert editor.lines != original_lines
+        editor._undo()
+        assert editor.lines == original_lines
+
+    # -- change --
+
+    def test_linewise_change(self):
+        editor = self._make_editor()
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 1
+        editor._handle_normal(self._key("c"))
+        assert editor._visual_mode == ""
+        assert editor._mode == EditorMode.INSERT
+
+    def test_charwise_change(self):
+        editor = self._make_editor()
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 1
+        editor._visual_anchor_col = 5
+        editor.cursor_row = 1
+        editor.cursor_col = 10
+        editor._handle_normal(self._key("c"))
+        assert editor._visual_mode == ""
+        assert editor._mode == EditorMode.INSERT
+
+    # -- paste --
+
+    def test_charwise_paste_after(self):
+        editor = self._make_editor('{"key": "value"}')
+        editor._yank_type = "char"
+        editor.yank_buffer = ["abc"]
+        editor.cursor_row = 0
+        editor.cursor_col = 0
+        editor._paste_after()
+        assert editor.lines[0] == '{abc"key": "value"}'
+
+    def test_charwise_paste_before(self):
+        editor = self._make_editor('{"key": "value"}')
+        editor._yank_type = "char"
+        editor.yank_buffer = ["abc"]
+        editor.cursor_row = 0
+        editor.cursor_col = 1
+        editor._paste_before()
+        assert editor.lines[0] == '{abc"key": "value"}'
+
+    def test_linewise_paste_after_preserves_behavior(self):
+        editor = self._make_editor('{"key": "value"}')
+        editor._yank_type = "line"
+        editor.yank_buffer = ['    "new": true']
+        editor.cursor_row = 0
+        editor.cursor_col = 0
+        editor._paste_after()
+        assert len(editor.lines) == 2
+        assert editor.lines[1] == '    "new": true'
+
+    # -- read-only --
+
+    def test_readonly_allows_yank(self):
+        editor = self._make_editor()
+        editor.read_only = True
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 1
+        editor._handle_normal(self._key("y"))
+        assert len(editor.yank_buffer) == 1
+
+    def test_readonly_blocks_delete(self):
+        editor = self._make_editor()
+        editor.read_only = True
+        original_lines = editor.lines[:]
+        editor._visual_mode = "V"
+        editor._visual_anchor_row = 1
+        editor.cursor_row = 1
+        editor._handle_normal(self._key("d"))
+        assert editor.lines == original_lines
+        assert editor._visual_mode == ""
+
+    def test_readonly_blocks_change(self):
+        editor = self._make_editor()
+        editor.read_only = True
+        editor._visual_mode = "v"
+        editor._visual_anchor_row = 0
+        editor._visual_anchor_col = 0
+        editor.cursor_row = 0
+        editor.cursor_col = 5
+        editor._handle_normal(self._key("c"))
+        assert editor._mode == EditorMode.NORMAL
+
+    # -- yy/dd는 line yank type 유지 --
+
+    def test_yy_sets_line_yank_type(self):
+        editor = self._make_editor()
+        editor._yank_type = "char"
+        editor.pending = "y"
+        editor._handle_pending("y", "y")
+        assert editor._yank_type == "line"
+
+    def test_dd_sets_line_yank_type(self):
+        editor = self._make_editor()
+        editor._yank_type = "char"
+        editor.pending = "d"
+        editor._handle_pending("d", "d")
+        assert editor._yank_type == "line"
+
+    # -- undo/redo는 visual mode 해제 --
+
+    def test_undo_clears_visual(self):
+        editor = self._make_editor()
+        editor._save_undo()
+        editor._visual_mode = "V"
+        editor._undo()
+        assert editor._visual_mode == ""
+
+    def test_redo_clears_visual(self):
+        editor = self._make_editor()
+        editor._save_undo()
+        editor.lines = ["changed"]
+        editor._undo()
+        editor._visual_mode = "v"
+        editor._redo()
+        assert editor._visual_mode == ""
+
+    # -- 모드 전환 시 visual 해제 --
+
+    def test_colon_clears_visual(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        assert editor._visual_mode == "v"
+        editor._handle_normal(self._key(":"))
+        assert editor._visual_mode == ""
+
+    def test_slash_clears_visual(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        editor._handle_normal(self._key("/"))
+        assert editor._visual_mode == ""
+
+    def test_question_clears_visual(self):
+        editor = self._make_editor()
+        editor._handle_normal(self._key("v"))
+        editor._handle_normal(self._key("?"))
+        assert editor._visual_mode == ""
