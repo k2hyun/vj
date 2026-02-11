@@ -11,7 +11,7 @@ from jvim.diff import (
     normalize_json,
     normalize_jsonl,
 )
-from jvim.diff_app import DiffEditor, JsonDiffApp, SyncJsonEditor
+from jvim.differ import DiffEditor, JsonDiffApp, SyncJsonEditor
 
 
 class TestFormatJson:

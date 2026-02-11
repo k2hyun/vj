@@ -1,5 +1,5 @@
 """Allow running with `python -m jvim`."""
 
-from .app import main
+from .editor import main
 
 main()

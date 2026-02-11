@@ -1,6 +1,6 @@
 """Tests for JsonEditor widget."""
 
-from src.jvim.editor import JsonEditor, EditorMode
+from src.jvim.widget import JsonEditor, EditorMode
 
 
 class TestEditorBasic:

@@ -1,2544 +1,383 @@
-"""Modal JSON editor widget."""
+"""Demo application for the JSON editor."""
 
 from __future__ import annotations
 
+import argparse
 import json
-import re
-import unicodedata
-from dataclasses import dataclass
-from enum import Enum, auto
+import sys
+from pathlib import Path
 
-from rich.text import Text
-from textual import events
-from textual.message import Message
-from textual.reactive import reactive
-from textual.widget import Widget
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Button, Header, Static
 
+from .widget import JsonEditor
 
-class EditorMode(Enum):
-    NORMAL = auto()
-    INSERT = auto()
-    COMMAND = auto()
-    SEARCH = auto()
+# Data directory path
+_DATA_DIR = Path(__file__).parent / "data"
+# Config directory and history file
+_CONFIG_DIR = Path.home() / ".jvim"
+_HISTORY_FILE = _CONFIG_DIR / "history.json"
 
 
-class JsonEditor(Widget, can_focus=True):
-    """A modal JSON editor Textual widget.
+def _load_data(filename: str) -> str:
+    """Load content from data directory."""
+    return (_DATA_DIR / filename).read_text(encoding="utf-8")
 
-    Supported commands:
-      NORMAL: h j k l  w b  0 $ ^  gg G  %  i I a A o O
-              x  dd dw d$  cw cc  r{c}  J  yy p P  u
-      INSERT: typing / Backspace / Enter / Tab / Escape
-      COMMAND: :w :q :wq :fmt
-    """
 
-    DEFAULT_CSS = """
-    JsonEditor {
-        height: 1fr;
-        background: $surface;
-        padding: 0 1;
-    }
-    """
-
-    mode: reactive[EditorMode] = reactive(EditorMode.NORMAL)
-
-    # -- Messages ----------------------------------------------------------
-
-    @dataclass
-    class JsonValidated(Message):
-        content: str
-        valid: bool
-        error: str = ""
-
-    @dataclass
-    class FileSaveRequested(Message):
-        content: str
-        file_path: str       # empty string means save to current file
-        quit_after: bool = False
-
-    @dataclass
-    class FileOpenRequested(Message):
-        file_path: str
-
-    @dataclass
-    class Quit(Message):
+def _load_history() -> dict:
+    """Load command/search history from file."""
+    try:
+        if _HISTORY_FILE.exists():
+            return json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
         pass
+    return {}
 
-    @dataclass
-    class ForceQuit(Message):
-        pass
 
-    @dataclass
-    class HelpToggleRequested(Message):
-        pass
+def _save_history(history: dict) -> None:
+    """Save command/search history to file."""
+    try:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _HISTORY_FILE.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # Silently fail if we can't write history
 
-    @dataclass
-    class EmbeddedEditRequested(Message):
-        content: str  # Parsed JSON content to edit
-        source_row: int  # Row of the string value
-        source_col_start: int  # Column where string starts (including quote)
-        source_col_end: int  # Column where string ends (including quote)
 
-    @dataclass
-    class EmbeddedEditSave(Message):
-        content: str  # Updated JSON content
+class JsonEditorApp(App):
+    """TUI app that wraps the JsonEditor widget."""
 
-    # -- Init --------------------------------------------------------------
+    CSS_PATH = "editor.tcss"
+    TITLE = "JSON Editor"
+    BINDINGS = []
+    ENABLE_COMMAND_PALETTE = False
 
     def __init__(
         self,
+        file_path: str = "",
         initial_content: str = "",
-        *,
         read_only: bool = False,
         jsonl: bool = False,
-        name: str | None = None,
-        id: str | None = None,
-        classes: str | None = None,
+        **kwargs,
     ) -> None:
-        super().__init__(name=name, id=id, classes=classes)
-        self.read_only: bool = read_only
-        self.jsonl: bool = jsonl
-        if self.jsonl and initial_content:
-            initial_content = self._jsonl_to_pretty(initial_content)
-        self.lines: list[str] = (
-            initial_content.split("\n") if initial_content else [""]
+        super().__init__(**kwargs)
+        self.file_path = file_path
+        self.initial_content = initial_content
+        self.read_only = read_only
+        self.jsonl = jsonl
+        # Embedded edit state - stack of (row, col_start, col_end, parent_content, original_content)
+        self._ej_stack: list[tuple[int, int, int, str, str]] = []
+        self._main_was_read_only: bool = False
+        self._main_scroll_top: int = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield JsonEditor(
+            self.initial_content,
+            read_only=self.read_only,
+            jsonl=self.jsonl,
+            id="editor",
         )
-        self.cursor_row: int = 0
-        self.cursor_col: int = 0
-        self._mode: EditorMode = EditorMode.NORMAL
-        self.command_buffer: str = ""
-        self.pending: str = ""
-        self.status_msg: str = ""
-        self.undo_stack: list[tuple[list[str], int, int]] = []
-        self.redo_stack: list[tuple[list[str], int, int]] = []
-        self.yank_buffer: list[str] = []
-        self._scroll_top: int = 0
-        self._dot_buffer: list[tuple[str, str | None]] = []
-        self._dot_recording: bool = False
-        self._dot_replaying: bool = False
-        # Search state
-        self._search_buffer: str = ""
-        self._search_pattern: str = ""
-        self._search_forward: bool = True  # True for /, False for ?
-        self._search_matches: list[tuple[int, int, int]] = []  # (row, col_start, col_end)
-        self._search_match_by_row: dict[int, list[tuple[int, int, int]]] = {}  # Fast lookup
-        self._current_match: int = -1  # Index in _search_matches
-        self._search_history: list[str] = []  # Previous search patterns
-        self._search_history_idx: int = -1  # Current position in history (-1 = new search)
-        self._search_history_max: int = 50  # Max history size
-        # Command history
-        self._command_history: list[str] = []  # Previous commands
-        self._command_history_idx: int = -1  # Current position in history
-        self._command_history_max: int = 50  # Max history size
-        # Render caches
-        self._style_cache: dict[int, list[str]] = {}
-        self._cache_dirty: bool = False
-        self._jsonl_records_cache: list[int] | None = None
-        self._char_width_cache: dict[str, int] = {}
-        # Fold state
-        self._folds: dict[int, int] = {}  # {fold_header_line: fold_end_line}
-        self._collapsed_strings: set[int] = set()  # 접힌 긴 string 라인
-        self._string_collapse_threshold: int = 60  # 이 길이 이상의 string value를 접기 대상으로
+        with Vertical(id="help-panel"):
+            with Horizontal(id="help-header"):
+                yield Static("[b]Help[/b]", id="help-title")
+                yield Button("\u2715", id="help-close", variant="error")
+            yield JsonEditor(_load_data("help.json"), read_only=True, id="help-editor")
+        with Vertical(id="ej-panel"):
+            with Horizontal(id="ej-header"):
+                yield Static("[b]Edit Embedded JSON[/b]", id="ej-title")
+                yield Button("\u2715", id="ej-close", variant="error")
+            yield JsonEditor("", id="ej-editor")
 
-    # -- Helpers -----------------------------------------------------------
+    def on_mount(self) -> None:
+        self._update_title()
+        # Load history
+        editor = self.query_one("#editor", JsonEditor)
+        history = _load_history()
+        editor.set_history(history)
+        # 1-depth 기준으로 자동 fold
+        editor._fold_at_depth(1)
+        editor.focus()
 
-    def _invalidate_caches(self) -> None:
-        """Invalidate render caches when content changes."""
-        self._cache_dirty = True
-
-    def _check_readonly(self) -> bool:
-        """Check if read-only and set status. Returns True if read-only."""
-        if self.read_only:
-            self.status_msg = "[readonly]"
-        return self.read_only
-
-    def _dot_start(self, event) -> None:
-        """Begin recording a new edit sequence for dot-repeat."""
-        if self._dot_replaying:
-            return
-        self._dot_buffer = [(event.key, event.character)]
-        self._dot_recording = True
-
-    def _dot_stop(self) -> None:
-        self._dot_recording = False
-
-    def _dot_replay(self) -> None:
-        """Replay the last recorded edit sequence."""
-        if not self._dot_buffer:
-            return
-        from types import SimpleNamespace
-
-        self._dot_replaying = True
-        for rkey, rchar in self._dot_buffer:
-            mock = SimpleNamespace(key=rkey, character=rchar)
-            if self._mode == EditorMode.NORMAL:
-                self._handle_normal(mock)
-            elif self._mode == EditorMode.INSERT:
-                self._handle_insert(mock)
-            self._clamp_cursor()
-        self._dot_replaying = False
-
-    def _save_undo(self) -> None:
-        self.undo_stack.append((self.lines[:], self.cursor_row, self.cursor_col))
-        if len(self.undo_stack) > 200:
-            self.undo_stack.pop(0)
-        # Clear redo stack on new edit
-        if self.redo_stack:
-            self.redo_stack.clear()
-        self._invalidate_caches()
-
-    def _clamp_cursor(self) -> None:
-        self.cursor_row = max(0, min(self.cursor_row, len(self.lines) - 1))
-        # fold 안이면 fold 헤더로 snap
-        if self._folds and self._is_line_folded(self.cursor_row):
-            for start, end in self._folds.items():
-                if start < self.cursor_row <= end:
-                    self.cursor_row = start
-                    break
-        # collapsed string에서 커서가 숨겨진 영역에 진입하면 자동 펼기
-        row = self.cursor_row
-        if row in self._collapsed_strings:
-            info = self._find_long_string_at(row)
-            if info:
-                qs, _qe, _slen = info
-                # 미리보기 끝 위치: 여는 따옴표 + preview 문자수
-                visible_end = qs + 1 + min(20, _qe - qs - 2)
-                if self.cursor_col > visible_end:
-                    self._collapsed_strings.discard(row)
-        # fold 헤더에서 커서가 라인 끝을 넘으려 하면 자동 펼기
-        if row in self._folds:
-            line_len_here = len(self.lines[row])
-            max_here = max(0, line_len_here - 1) if line_len_here else 0
-            if self.cursor_col > max_here:
-                del self._folds[row]
-        line_len = len(self.lines[self.cursor_row])
-        if self._mode == EditorMode.NORMAL:
-            max_col = max(0, line_len - 1) if line_len else 0
+    def _update_title(self) -> None:
+        ro = " [RO]" if self.read_only else ""
+        if self.file_path:
+            self.sub_title = self.file_path + ro
         else:
-            max_col = line_len
-        self.cursor_col = max(0, min(self.cursor_col, max_col))
+            self.sub_title = "[new]" + ro
 
-    def _char_width(self, ch: str) -> int:
-        """Return display width of a character (2 for fullwidth/wide)."""
-        if ch < "\u0100":
-            return 1
-        w = self._char_width_cache.get(ch)
-        if w is None:
-            w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-            self._char_width_cache[ch] = w
-        return w
+    def _save_and_exit(self) -> None:
+        """Save history and exit the app."""
+        editor = self.query_one("#editor", JsonEditor)
+        _save_history(editor.get_history())
+        self.exit()
 
-    def _make_segments(self, line: str, avail: int) -> list[tuple[int, int]]:
-        """Break *line* into segments fitting within *avail* display columns."""
-        if not line:
-            return [(0, 0)]
-        if line.isascii():
-            return [
-                (s, min(s + avail, len(line)))
-                for s in range(0, len(line), avail)
-            ]
-        segs: list[tuple[int, int]] = []
-        seg_start = 0
-        w = 0
-        for i, ch in enumerate(line):
-            cw = self._char_width(ch)
-            if w + cw > avail and i > seg_start:
-                segs.append((seg_start, i))
-                seg_start = i
-                w = cw
+    # -- Event handlers ----------------------------------------------------
+
+    def _is_help_editor_focused(self) -> bool:
+        focused = self.focused
+        return focused is not None and focused.id == "help-editor"
+
+    def _is_ej_editor_focused(self) -> bool:
+        focused = self.focused
+        return focused is not None and focused.id == "ej-editor"
+
+    def on_key(self) -> None:
+        """Update ej title on key press to reflect modified state."""
+        if self._is_ej_editor_focused() and self._ej_stack:
+            self._update_ej_title()
+
+    def on_json_editor_quit(self, event: JsonEditor.Quit) -> None:
+        if self._is_help_editor_focused():
+            self.query_one("#help-panel").remove_class("visible")
+            self.query_one("#editor").focus()
+        elif self._is_ej_editor_focused():
+            if self._ej_has_unsaved_changes():
+                self.notify("Unsaved changes! Use :w to save or :q! to discard", severity="warning")
             else:
-                w += cw
-        segs.append((seg_start, len(line)))
-        return segs
-
-    def _wrap_rows(self, line: str, avail: int) -> int:
-        """Return the number of display rows a line occupies when wrapped."""
-        if not line:
-            return 1
-        if line.isascii():
-            return -(-len(line) // avail)
-        rows = 1
-        w = 0
-        for ch in line:
-            cw = self._char_width(ch)
-            if w + cw > avail:
-                rows += 1
-                w = cw
-            else:
-                w += cw
-        return rows
-
-    def _cursor_wrap_dy(self, line: str, cursor_col: int, avail: int) -> int:
-        """Return the wrapped row index (0-based) of *cursor_col* within *line*."""
-        segs = self._make_segments(line, avail)
-        for si, (s_start, s_end) in enumerate(segs):
-            if cursor_col < s_end:
-                return si
-        # cursor at end of line — check if cursor block fits on last row
-        if line:
-            ls, le = segs[-1]
-            last_w = sum(self._char_width(line[c]) for c in range(ls, le))
-            if last_w + 1 > avail:
-                return len(segs)
-        return max(0, len(segs) - 1)
-
-    def _gutter_widths(self) -> tuple[int, int, int]:
-        """Return ``(ln_width, rec_width, prefix_width)``.
-
-        *rec_width* is 0 when not in JSONL mode.
-        """
-        ln_width = max(3, len(str(len(self.lines))))
-        if not self.jsonl:
-            return ln_width, 0, ln_width + 1
-        rec_count = 0
-        in_block = False
-        for line in self.lines:
-            if line.strip():
-                if not in_block:
-                    rec_count += 1
-                    in_block = True
-            else:
-                in_block = False
-        rec_width = max(2, len(str(max(1, rec_count))))
-        return ln_width, rec_width, rec_width + 1 + ln_width + 1
-
-    def _jsonl_line_records(self) -> list[int]:
-        """Map each editor line to its JSONL record number.
-
-        The first line of each block gets the 1-based record number;
-        all other lines (continuation / blank separator) get 0.
-        """
-        result = [0] * len(self.lines)
-        record = 0
-        in_block = False
-        for i, line in enumerate(self.lines):
-            if line.strip():
-                if not in_block:
-                    record += 1
-                    result[i] = record
-                    in_block = True
-            else:
-                in_block = False
-        return result
-
-    def _visible_height(self) -> int:
-        return max(1, self.content_region.height - 2)
-
-    def _ensure_cursor_visible(self, avail: int) -> None:
-        base_vh = self._visible_height()
-        jsonl_records = self._jsonl_records_cache if self.jsonl else None
-
-        def _effective_vh(scroll_top: int) -> int:
-            if jsonl_records and scroll_top > 0 and jsonl_records[scroll_top] == 0:
-                return base_vh - 1
-            return base_vh
-
-        vh = _effective_vh(self._scroll_top)
-
-        if self.cursor_row < self._scroll_top:
-            self._scroll_top = self.cursor_row
-
-        wrap_rows = self._wrap_rows
-        lines = self.lines
-        is_folded = self._is_line_folded if self._folds else None
-        rows_before = sum(
-            wrap_rows(lines[i], avail)
-            for i in range(self._scroll_top, self.cursor_row)
-            if not (is_folded and is_folded(i))
-        )
-        cursor_dy = self._cursor_wrap_dy(
-            lines[self.cursor_row], self.cursor_col, avail
-        )
-        while rows_before + cursor_dy >= vh and self._scroll_top <= self.cursor_row:
-            if not (is_folded and is_folded(self._scroll_top)):
-                rows_before -= wrap_rows(lines[self._scroll_top], avail)
-            self._scroll_top += 1
-            vh = _effective_vh(self._scroll_top)
-
-    def _scroll_cursor_to_top(self) -> None:
-        """Position viewport so cursor is at the top of the screen."""
-        self._scroll_top = self.cursor_row
-
-    def _scroll_cursor_to_center(self, ratio: float = 0.33) -> None:
-        """Position viewport so cursor is at given ratio from top (default 1/3)."""
-        vh = self._visible_height()
-        offset = int(vh * ratio)
-        self._scroll_top = max(0, self.cursor_row - offset)
-
-    # -- Public API --------------------------------------------------------
-
-    def get_content(self) -> str:
-        return "\n".join(self.lines)
-
-    def set_content(self, content: str) -> None:
-        if self.jsonl and content:
-            content = self._jsonl_to_pretty(content)
-        self.lines = content.split("\n") if content else [""]
-        self.cursor_row = 0
-        self.cursor_col = 0
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        self._invalidate_caches()
-        self.refresh()
-
-    def get_history(self) -> dict:
-        """Get search and command history for persistence."""
-        return {
-            "search": self._search_history[:],
-            "command": self._command_history[:],
-        }
-
-    def set_history(self, history: dict) -> None:
-        """Restore search and command history."""
-        if "search" in history:
-            self._search_history = history["search"][: self._search_history_max]
-        if "command" in history:
-            self._command_history = history["command"][: self._command_history_max]
-
-    # =====================================================================
-    # Rendering
-    # =====================================================================
-
-    def _line_background(self, line_idx: int) -> str:
-        """서브클래스에서 라인별 배경 스타일을 지정하기 위한 훅."""
-        return ""
-
-    def render(self) -> Text:
-        width = self.content_region.width
-        height = self.content_region.height
-        if height < 3 or width < 10:
-            return Text("(too small)")
-
-        # Flush caches when content changed
-        if self._cache_dirty:
-            self._style_cache.clear()
-            self._jsonl_records_cache = None
-            self._cache_dirty = False
-
-        content_height = height - 2
-        ln_width, rec_width, prefix_w = self._gutter_widths()
-        avail = max(1, width - prefix_w)
-        # Use cached JSONL records
-        if self.jsonl:
-            if self._jsonl_records_cache is None:
-                self._jsonl_records_cache = self._jsonl_line_records()
-            jsonl_records = self._jsonl_records_cache
+                self._close_ej_panel()
         else:
-            jsonl_records = None
+            self._save_and_exit()
 
-        self._ensure_cursor_visible(avail)
-
-        # Local references for hot path
-        lines = self.lines
-        cursor_row = self.cursor_row
-        cursor_col = self.cursor_col
-        make_segments = self._make_segments
-        char_width = self._char_width
-        style_cache = self._style_cache
-        compute_styles = self._compute_line_styles
-        search_by_row = self._search_match_by_row
-        result_append = Text.append
-
-        result = Text()
-        rows_used = 0
-        line_idx = self._scroll_top
-        num_lines = len(lines)
-        gutter_pad = " " * prefix_w  # 래핑된 줄의 거터 공백 (미리 생성)
-
-        # Floating header for JSONL: show record start line when scrolled into middle of record
-        if self.jsonl and jsonl_records and self._scroll_top > 0:
-            first_visible_rec = jsonl_records[self._scroll_top]
-            if first_visible_rec == 0:
-                # We're in the middle of a record, find its start line
-                rec_start_line = self._scroll_top - 1
-                while rec_start_line >= 0 and jsonl_records[rec_start_line] == 0:
-                    rec_start_line -= 1
-                if rec_start_line >= 0:
-                    rec_num = jsonl_records[rec_start_line]
-                    # Show floating header
-                    header = f"{rec_start_line + 1:>{ln_width}} {rec_num:>{rec_width}} ↓"
-                    result_append(result, header, style="bold cyan on grey23")
-                    result_append(result, " " * (width - len(header)) + "\n")
-                    rows_used += 1
-
-        folds = self._folds
-        collapsed_strs = self._collapsed_strings
-        while rows_used < content_height and line_idx < num_lines:
-            # 접힌 라인 스킵
-            if folds and self._is_line_folded(line_idx):
-                line_idx += 1
-                continue
-
-            line = lines[line_idx]
-            is_cursor_line = line_idx == cursor_row
-            is_fold_header = line_idx in folds
-
-            # Collapsed string: 라인을 잘라서 표시
-            str_collapse_info = None
-            if line_idx in collapsed_strs:
-                info = self._find_long_string_at(line_idx)
-                if info:
-                    qs, qe, slen = info
-                    # 미리보기: 처음 20자 + ...
-                    preview_len = min(20, qe - qs - 2)
-                    # raw string에서 미리보기 추출 (따옴표 안쪽)
-                    preview = line[qs + 1:qs + 1 + preview_len]
-                    suffix = f'..." ({slen} chars)'
-                    # 접힌 라인: key 부분 + "preview..." (N chars) + trailing
-                    collapsed_line = line[:qs] + '"' + preview + suffix + line[qe:]
-                    collapsed_styles = compute_styles(collapsed_line)
-                    # suffix 부분을 dim italic으로 변경
-                    suffix_start = qs + 1 + preview_len
-                    for ci in range(suffix_start, suffix_start + len(suffix)):
-                        if ci < len(collapsed_styles):
-                            collapsed_styles[ci] = "dim italic"
-                    str_collapse_info = (collapsed_line, collapsed_styles)
-
-            if str_collapse_info:
-                line, line_styles = str_collapse_info
-            else:
-                # Use cached styles or compute
-                if line_idx in style_cache:
-                    line_styles = style_cache[line_idx]
-                else:
-                    line_styles = compute_styles(line)
-                    style_cache[line_idx] = line_styles
-
-            line_len = len(line)
-
-            # Break line into width-aware wrapped segments
-            segs = make_segments(line, avail)
-            # Cursor at end of line may need an extra wrap row
-            if is_cursor_line and cursor_col >= line_len and line:
-                ls, le = segs[-1]
-                last_w = sum(char_width(line[c]) for c in range(ls, le))
-                if last_w + 1 > avail:
-                    segs.append((line_len, line_len))
-
-            # 라인 배경 (diff 하이라이팅 등 서브클래스용 훅)
-            line_bg = self._line_background(line_idx)
-            has_search = search_by_row and line_idx in search_by_row
-            # 변이가 필요한 경우에만 복사
-            if line_bg or has_search:
-                line_styles = line_styles[:]
-                if line_bg:
-                    for c in range(len(line_styles)):
-                        line_styles[c] = f"{line_bg} {line_styles[c]}"
-                if has_search:
-                    for m_start, m_end, mi in search_by_row[line_idx]:
-                        is_current = mi == self._current_match
-                        style = "black on yellow" if is_current else "black on dark_goldenrod"
-                        for c in range(m_start, min(m_end, line_len)):
-                            line_styles[c] = style
-
-            # Collapsed string은 1줄만 렌더 (wrap 방지)
-            if str_collapse_info:
-                segs = segs[:1]
-
-            for si, (s_start, s_end) in enumerate(segs):
-                if rows_used >= content_height:
-                    break
-                # Line number on first segment, or first visible row (floating line number)
-                if si == 0 or rows_used == 0:
-                    result_append(result, f"{line_idx + 1:>{ln_width}} ", style="dim cyan")
-                    if rec_width:
-                        rec_num = jsonl_records[line_idx]
-                        if rec_num:
-                            result_append(result, f"{rec_num:>{rec_width}} ", style="dim yellow")
-                        else:
-                            result_append(result, " " * (rec_width + 1))
-                else:
-                    result_append(result, gutter_pad)
-                # Render segment — batch consecutive chars with same style
-                col = s_start
-                while col < s_end:
-                    if is_cursor_line and col == cursor_col:
-                        result_append(result, line[col], style=f"reverse {line_styles[col]}")
-                        col += 1
-                        continue
-                    sty = line_styles[col]
-                    end = col + 1
-                    while end < s_end and line_styles[end] == sty and not (is_cursor_line and end == cursor_col):
-                        end += 1
-                    result_append(result, line[col:end], style=sty)
-                    col = end
-                # Cursor block at end of line (insert mode)
-                if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
-                    result_append(result, " ", style="reverse")
-                # Fold summary 표시
-                fold_summary_w = 0
-                if is_fold_header and si == 0:
-                    hidden = folds[line_idx] - line_idx
-                    summary = f" ... ({hidden} lines)"
-                    fold_summary_w = len(summary)
-                    result_append(result, summary, style="dim italic")
-                # 라인 배경이 있으면 나머지 너비를 배경색으로 채움
-                if line_bg:
-                    seg_w = sum(char_width(line[c]) for c in range(s_start, s_end))
-                    if is_cursor_line and cursor_col >= line_len and si == len(segs) - 1:
-                        seg_w += 1
-                    pad = avail - seg_w - fold_summary_w
-                    if pad > 0:
-                        result_append(result, " " * pad, style=line_bg)
-                result_append(result, "\n")
-                rows_used += 1
-
-            line_idx += 1
-
-        # Fill remaining rows with ~
-        if rows_used < content_height:
-            tilde_line = f"{'~':>{prefix_w - 1}} \n"
-            while rows_used < content_height:
-                result_append(result, tilde_line, style="dim blue")
-                rows_used += 1
-
-        # status bar
-        mode = self._mode
-        mode_label = f" {mode.name} "
-        result_append(result, mode_label, style=self._MODE_STYLE[mode])
-
-        read_only = self.read_only
-        if read_only:
-            result_append(result, " RO ", style="bold white on grey37")
-
-        pending = self.pending
-        if pending:
-            result_append(result, f"  {pending}", style="bold yellow")
-
-        status_msg = self.status_msg
-        pos = f" Ln {cursor_row + 1}/{num_lines}, Col {cursor_col + 1} "
-        ro_len = 4 if read_only else 0
-        spacer_len = max(0, width - len(mode_label) - ro_len - len(pos) - len(status_msg) - 4)
-        result_append(result, f"  {status_msg}")
-        if spacer_len:
-            result_append(result, " " * spacer_len)
-        result_append(result, pos, style="bold")
-
-        if mode == EditorMode.COMMAND:
-            result_append(result, f"\n:{self.command_buffer}", style="bold yellow")
-            result_append(result, " ", style="reverse")
-        elif mode == EditorMode.SEARCH:
-            prefix = "/" if self._search_forward else "?"
-            result_append(result, f"\n{prefix}{self._search_buffer}", style="bold magenta")
-            result_append(result, " ", style="reverse")
+    def on_json_editor_force_quit(self, event: JsonEditor.ForceQuit) -> None:
+        """Handle :q! to discard changes."""
+        if self._is_help_editor_focused():
+            self.query_one("#help-panel").remove_class("visible")
+            self.query_one("#editor").focus()
+        elif self._is_ej_editor_focused():
+            self._close_ej_panel()
         else:
-            result_append(result, "\n")
+            self._save_and_exit()
 
-        return result
-
-    # -- Syntax colouring helpers ------------------------------------------
-
-    _BRACKET = frozenset("{}[]")
-    _PUNCT = frozenset(":,")
-    _DIGIT = frozenset("0123456789.-+eE")
-    _KEYWORDS = ("true", "false", "null")
-    _KEYWORD_RE = re.compile(r"true|false|null")
-    _MODE_STYLE = {
-        EditorMode.NORMAL: "bold white on dark_green",
-        EditorMode.INSERT: "bold white on dark_blue",
-        EditorMode.COMMAND: "bold white on dark_red",
-        EditorMode.SEARCH: "bold white on dark_magenta",
-    }
-    _BRACKET_PAIRS = {"{": "}", "[": "]", "(": ")"}
-    _BRACKET_PAIRS_REV = {"}": "{", "]": "[", ")": "("}
-
-    def _compute_line_styles(self, line: str) -> list[str]:
-        """Compute syntax highlight styles for every character in *line*."""
-        n = len(line)
-        if n == 0:
-            return []
-
-        # Local references for hot path
-        BRACKET = self._BRACKET
-        DIGIT = self._DIGIT
-
-        styles = ["white"] * n
-        is_in_str = [False] * n
-
-        # Single pass: track string regions and first unquoted colon
-        in_str = False
-        first_colon = -1
-        prev_ch = ""
-
-        for i, ch in enumerate(line):
-            if ch == '"' and prev_ch != "\\":
-                in_str = not in_str
-                is_in_str[i] = True
-            elif in_str:
-                is_in_str[i] = True
-            elif ch == ":" and first_colon == -1:
-                first_colon = i
-            prev_ch = ch
-
-        # Assign styles in single pass
-        for i, ch in enumerate(line):
-            if ch in BRACKET:
-                styles[i] = "bold white"
-            elif is_in_str[i]:
-                styles[i] = "cyan" if first_colon == -1 or i < first_colon else "green"
-            elif ch in DIGIT:
-                styles[i] = "yellow"
-            # PUNCT stays "white" (default)
-
-        # Keywords outside strings (single regex pass)
-        for m in self._KEYWORD_RE.finditer(line):
-            ms, me = m.start(), m.end()
-            if not is_in_str[ms]:
-                for j in range(ms, me):
-                    styles[j] = "magenta"
-
-        return styles
-
-    # =====================================================================
-    # Key handling
-    # =====================================================================
-
-    def on_key(self, event: events.Key) -> None:
-        event.prevent_default()
-        event.stop()
-
-        if not self._dot_replaying and self._dot_recording:
-            self._dot_buffer.append((event.key, event.character))
-
-        if self._mode == EditorMode.NORMAL:
-            self._handle_normal(event)
-        elif self._mode == EditorMode.INSERT:
-            self._handle_insert(event)
-        elif self._mode == EditorMode.COMMAND:
-            self._handle_command(event)
-        elif self._mode == EditorMode.SEARCH:
-            self._handle_search(event)
-
-        self._clamp_cursor()
-        self.refresh()
-
-    # -- NORMAL ------------------------------------------------------------
-
-    def _enter_insert(self) -> None:
-        if self.read_only:
-            self.status_msg = "[readonly]"
-            return
-        self._mode = EditorMode.INSERT
-        self.status_msg = "-- INSERT --"
-
-    def _handle_normal(self, event: events.Key) -> None:
-        key = event.key
-        char = event.character or ""
-
-        if self.pending:
-            self._handle_pending(char, key)
-            return
-
-        # movement
-        if char == "h" or key == "left":
-            self.cursor_col -= 1
-        elif char == "j" or key == "down":
-            self.cursor_row = self._next_visible_line(self.cursor_row, 1) if self._folds else self.cursor_row + 1
-        elif char == "k" or key == "up":
-            self.cursor_row = self._next_visible_line(self.cursor_row, -1) if self._folds else self.cursor_row - 1
-        elif char == "l" or key == "right":
-            self.cursor_col += 1
-        elif char == "w":
-            self._move_word_forward()
-        elif char == "b":
-            self._move_word_backward()
-        elif char == "0":
-            self.cursor_col = 0
-        elif char == "$" or key == "end":
-            self.cursor_col = max(0, len(self.lines[self.cursor_row]) - 1)
-        elif char == "^" or key == "home":
-            line = self.lines[self.cursor_row]
-            self.cursor_col = len(line) - len(line.lstrip())
-        elif char == "G":
-            self.cursor_row = len(self.lines) - 1
-            self._scroll_cursor_to_top()
-        elif char == "%":
-            self._jump_matching_bracket()
-        elif key == "pagedown" or key == "ctrl+f":
-            if self._folds:
-                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height(), 1)
-            else:
-                self.cursor_row += self._visible_height()
-        elif key == "pageup" or key == "ctrl+b":
-            if self._folds:
-                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height(), -1)
-            else:
-                self.cursor_row -= self._visible_height()
-        elif key == "ctrl+d":
-            if self._folds:
-                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height() // 2, 1)
-            else:
-                self.cursor_row += self._visible_height() // 2
-        elif key == "ctrl+u":
-            if self._folds:
-                self.cursor_row = self._skip_visible_lines(self.cursor_row, self._visible_height() // 2, -1)
-            else:
-                self.cursor_row -= self._visible_height() // 2
-        elif key == "ctrl+e":
-            nxt = self._next_visible_line(self._scroll_top, 1) if self._folds else self._scroll_top + 1
-            self._scroll_top = min(nxt, len(self.lines) - 1)
-        elif key == "ctrl+y":
-            prev = self._next_visible_line(self._scroll_top, -1) if self._folds else self._scroll_top - 1
-            self._scroll_top = max(prev, 0)
-        elif key == "ctrl+g":
-            total = len(self.lines)
-            pct = (self.cursor_row + 1) * 100 // total if total else 0
-            self.status_msg = (
-                f'"{self._mode.name}" line {self.cursor_row + 1} of {total}'
-                f" --{pct}%--"
-            )
-
-        # enter insert mode
-        elif char == "i":
-            if not self.read_only:
-                self._dot_start(event)
-            self._enter_insert()
-        elif char == "I":
-            if not self.read_only:
-                self._dot_start(event)
-            line = self.lines[self.cursor_row]
-            self.cursor_col = len(line) - len(line.lstrip())
-            self._enter_insert()
-        elif char == "a":
-            if not self.read_only:
-                self._dot_start(event)
-            self.cursor_col += 1
-            self._enter_insert()
-        elif char == "A":
-            if not self.read_only:
-                self._dot_start(event)
-            self.cursor_col = len(self.lines[self.cursor_row])
-            self._enter_insert()
-        elif char == "o":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._save_undo()
-                indent = self._current_indent()
-                before = self.lines[self.cursor_row].rstrip()
-                extra = "    " if before.endswith(("{", "[")) else ""
-                self.cursor_row += 1
-                self.lines.insert(self.cursor_row, " " * indent + extra)
-                self.cursor_col = indent + len(extra)
-                self._enter_insert()
-        elif char == "O":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._save_undo()
-                indent = self._current_indent()
-                self.lines.insert(self.cursor_row, " " * indent)
-                self.cursor_col = indent
-                self._enter_insert()
-
-        # single-key edits
-        elif char == "x":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._dot_stop()
-                self._save_undo()
-                line = self.lines[self.cursor_row]
-                if line and self.cursor_col < len(line):
-                    self.lines[self.cursor_row] = (
-                        line[: self.cursor_col] + line[self.cursor_col + 1 :]
-                    )
-        elif char == "p":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._dot_stop()
-                self._paste_after()
-        elif char == "P":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._dot_stop()
-                self._paste_before()
-        elif char == "u":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._undo()
-        elif key == "ctrl+r":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._redo()
-        elif char == "J":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._dot_start(event)
-                self._dot_stop()
-                self._join_lines()
-
-        # dot repeat
-        elif char == ".":
-            if not self.read_only:
-                self._dot_replay()
-
-        # multi-key starters
-        elif char in ("d", "c", "y", "r", "g", "e", "z"):
-            if self.read_only and char not in ("y", "g", "e", "z"):
-                self.status_msg = "[readonly]"
-            else:
-                if char not in ("y", "g", "e", "z"):
-                    self._dot_start(event)
-                self.pending = char
-
-        # search mode
-        elif char == "/":
-            self._mode = EditorMode.SEARCH
-            self._search_buffer = ""
-            self._search_forward = True
-            self.status_msg = ""
-        elif char == "?":
-            self._mode = EditorMode.SEARCH
-            self._search_buffer = ""
-            self._search_forward = False
-            self.status_msg = ""
-        elif char == "n":
-            self._goto_next_match()
-        elif char == "N":
-            self._goto_prev_match()
-
-        # command mode
-        elif char == ":":
-            self._mode = EditorMode.COMMAND
-            self.command_buffer = ""
-            self.status_msg = ""
-
-    # -- Pending multi-char ------------------------------------------------
-
-    def _handle_pending(self, char: str, key: str) -> None:
-        if key == "escape" or not char:
-            self.pending = ""
-            self.status_msg = ""
-            self._dot_stop()
-            return
-
-        combo = self.pending + char
-        self.pending = ""
-
-        if self.read_only and combo not in ("yy", "gg", "ej"):
-            self.status_msg = "[readonly]"
-            return
-
-        if combo == "dd":
-            self._save_undo()
-            self.yank_buffer = [self.lines[self.cursor_row]]
-            if len(self.lines) > 1:
-                self.lines.pop(self.cursor_row)
-                if self.cursor_row >= len(self.lines):
-                    self.cursor_row = len(self.lines) - 1
-            else:
-                self.lines[0] = ""
-            self.cursor_col = 0
-            self.status_msg = "line deleted"
-            self._dot_stop()
-
-        elif combo == "dw":
-            self._save_undo()
-            self._delete_word()
-            self._dot_stop()
-
-        elif combo == "d$":
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            self.lines[self.cursor_row] = line[: self.cursor_col]
-            self._dot_stop()
-
-        elif combo == "d0":
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            self.lines[self.cursor_row] = line[self.cursor_col :]
-            self.cursor_col = 0
-            self._dot_stop()
-
-        elif combo == "cw":
-            self._save_undo()
-            self._delete_word()
-            self._enter_insert()
-            # recording continues into insert mode
-
-        elif combo == "cc":
-            self._save_undo()
-            indent = self._current_indent()
-            self.yank_buffer = [self.lines[self.cursor_row]]
-            self.lines[self.cursor_row] = " " * indent
-            self.cursor_col = indent
-            self._enter_insert()
-            # recording continues into insert mode
-
-        elif combo == "yy":
-            self.yank_buffer = [self.lines[self.cursor_row]]
-            self.status_msg = "line yanked"
-
-        elif combo == "gg":
-            self.cursor_row = 0
-            self.cursor_col = 0
-            self._scroll_cursor_to_top()
-
-        elif len(combo) == 2 and combo[0] == "r":
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            if self.cursor_col < len(line):
-                self.lines[self.cursor_row] = (
-                    line[: self.cursor_col] + combo[1] + line[self.cursor_col + 1 :]
-                )
-            self._dot_stop()
-
-        elif combo == "ej":
-            self._edit_embedded_json()
-
-        # fold 명령어
-        elif combo == "za":
-            self._toggle_fold(self.cursor_row)
-        elif combo == "zo":
-            self._open_fold(self.cursor_row)
-        elif combo == "zc":
-            self._close_fold(self.cursor_row)
-        elif combo == "zM":
-            self._fold_all()
-        elif combo == "zR":
-            self._unfold_all()
-
+    def on_json_editor_json_validated(
+        self, event: JsonEditor.JsonValidated
+    ) -> None:
+        if event.valid:
+            self.notify("JSON is valid", severity="information")
         else:
-            self._dot_stop()
-            self.status_msg = f"unknown: {combo}"
+            self.notify(f"Invalid JSON: {event.error}", severity="error", timeout=6)
 
-    # -- INSERT ------------------------------------------------------------
-
-    def _handle_insert(self, event: events.Key) -> None:
-        key = event.key
-        char = event.character
-
-        if key == "escape":
-            self._dot_stop()
-            self._mode = EditorMode.NORMAL
-            self.cursor_col = max(0, self.cursor_col - 1)
-            self.status_msg = ""
+    def on_json_editor_file_save_requested(
+        self, event: JsonEditor.FileSaveRequested
+    ) -> None:
+        # Help editor is read-only, so this shouldn't happen, but just in case
+        if self._is_help_editor_focused():
             return
 
-        if key == "backspace":
-            self._save_undo()
-            if self.cursor_col > 0:
-                line = self.lines[self.cursor_row]
-                self.lines[self.cursor_row] = (
-                    line[: self.cursor_col - 1] + line[self.cursor_col :]
-                )
-                self.cursor_col -= 1
-            elif self.cursor_row > 0:
-                prev = self.lines[self.cursor_row - 1]
-                self.cursor_col = len(prev)
-                self.lines[self.cursor_row - 1] = prev + self.lines[self.cursor_row]
-                self.lines.pop(self.cursor_row)
-                self.cursor_row -= 1
-            return
-
-        if key == "enter":
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            indent = len(line) - len(line.lstrip()) if line.strip() else 0
-            before = line[: self.cursor_col].rstrip()
-            after = line[self.cursor_col :].lstrip()
-
-            if before.endswith(("{", "[")) and after and after[0] in ("}", "]"):
-                closing_indent = " " * indent
-                new_indent = " " * indent + "    "
-                self.lines[self.cursor_row] = line[: self.cursor_col]
-                self.lines.insert(self.cursor_row + 1, new_indent)
-                self.lines.insert(
-                    self.cursor_row + 2,
-                    closing_indent + line[self.cursor_col :].lstrip(),
-                )
-                self.cursor_row += 1
-                self.cursor_col = len(new_indent)
-                return
-
-            extra = "    " if before.endswith(("{", "[")) else ""
-            self.lines[self.cursor_row] = line[: self.cursor_col]
-            new_line = " " * indent + extra + line[self.cursor_col :]
-            self.cursor_row += 1
-            self.lines.insert(self.cursor_row, new_line)
-            self.cursor_col = indent + len(extra)
-            return
-
-        if key == "tab":
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            self.lines[self.cursor_row] = (
-                line[: self.cursor_col] + "    " + line[self.cursor_col :]
-            )
-            self.cursor_col += 4
-            return
-
-        if key == "end":
-            self.cursor_col = len(self.lines[self.cursor_row])
-            return
-        if key == "home":
-            line = self.lines[self.cursor_row]
-            self.cursor_col = len(line) - len(line.lstrip())
-            return
-
-        if key in ("left", "right", "up", "down"):
-            delta = {"left": (0, -1), "right": (0, 1), "up": (-1, 0), "down": (1, 0)}
-            dr, dc = delta[key]
-            self.cursor_row += dr
-            self.cursor_col += dc
-            return
-
-        # auto-dedent for closing brackets
-        if char in ("}", "]"):
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            before = line[: self.cursor_col]
-            if before.strip() == "":
-                new_indent = max(0, len(before) - 4)
-                self.lines[self.cursor_row] = (
-                    " " * new_indent + char + line[self.cursor_col :]
-                )
-                self.cursor_col = new_indent + 1
-                return
-
-        if char and char.isprintable():
-            self._save_undo()
-            line = self.lines[self.cursor_row]
-            self.lines[self.cursor_row] = (
-                line[: self.cursor_col] + char + line[self.cursor_col :]
-            )
-            self.cursor_col += 1
-
-    # -- COMMAND -----------------------------------------------------------
-
-    def _handle_command(self, event: events.Key) -> None:
-        key = event.key
-        char = event.character
-
-        if key == "escape":
-            self._mode = EditorMode.NORMAL
-            self.command_buffer = ""
-            self._command_history_idx = -1
-            self.status_msg = ""
-            return
-
-        if key == "enter":
-            cmd = self.command_buffer.strip()
-            if cmd:
-                self._add_to_command_history(cmd)
-            self._exec_command(cmd)
-            if self._mode == EditorMode.COMMAND:
-                self._mode = EditorMode.NORMAL
-            self.command_buffer = ""
-            self._command_history_idx = -1
-            return
-
-        if key == "backspace":
-            if self.command_buffer:
-                self.command_buffer = self.command_buffer[:-1]
-                self._command_history_idx = -1
-            else:
-                self._mode = EditorMode.NORMAL
-                self._command_history_idx = -1
-            return
-
-        # History navigation
-        if key == "up":
-            self._command_history_prev()
-            return
-        if key == "down":
-            self._command_history_next()
-            return
-
-        if char and char.isprintable():
-            self.command_buffer += char
-            self._command_history_idx = -1
-
-    def _add_to_command_history(self, cmd: str) -> None:
-        """Add command to history, avoiding duplicates."""
-        if not cmd:
-            return
-        if cmd in self._command_history:
-            self._command_history.remove(cmd)
-        self._command_history.insert(0, cmd)
-        if len(self._command_history) > self._command_history_max:
-            self._command_history.pop()
-
-    def _command_history_prev(self) -> None:
-        """Navigate to previous command in history."""
-        if not self._command_history:
-            return
-        if self._command_history_idx < len(self._command_history) - 1:
-            self._command_history_idx += 1
-            self.command_buffer = self._command_history[self._command_history_idx]
-
-    def _command_history_next(self) -> None:
-        """Navigate to next command in history."""
-        if self._command_history_idx > 0:
-            self._command_history_idx -= 1
-            self.command_buffer = self._command_history[self._command_history_idx]
-        elif self._command_history_idx == 0:
-            self._command_history_idx = -1
-            self.command_buffer = ""
-
-    def _exec_command(self, cmd: str) -> None:
-        stripped = cmd.strip()
-
-        # :$ → jump to last line
-        if stripped == "$":
-            self.cursor_row = len(self.lines) - 1
-            self.cursor_col = 0
-            self._scroll_cursor_to_top()
-            return
-
-        # Line jump: :l<num> → editor line; :<num> or :p<num> → file line (JSONL record)
-        if len(stripped) > 1 and stripped[0] == "l" and stripped[1:].isdigit():
-            num = int(stripped[1:])
-            self.cursor_row = max(0, min(num - 1, len(self.lines) - 1))
-            self.cursor_col = 0
-            self._scroll_cursor_to_top()
-            return
-        if stripped.isdigit() or (len(stripped) > 1 and stripped[0] == "p" and stripped[1:].isdigit()):
-            num = int(stripped if stripped.isdigit() else stripped[1:])
-            if self.jsonl:
-                records = self._jsonl_line_records()
-                for i, rec in enumerate(records):
-                    if rec == num:
-                        self.cursor_row = i
-                        self.cursor_col = 0
-                        self._scroll_cursor_to_top()
-                        return
-                self.status_msg = f"record {num} not found"
-                return
-            self.cursor_row = max(0, min(num - 1, len(self.lines) - 1))
-            self.cursor_col = 0
-            self._scroll_cursor_to_top()
-            return
-
-        parts = cmd.split(None, 1)
-        verb = parts[0] if parts else ""
-        arg = parts[1] if len(parts) > 1 else ""
-
-        force = verb.endswith("!")
-        if force:
-            verb = verb[:-1]
-
-        if verb == "w":
-            if self.read_only:
-                self.status_msg = "[readonly]"
-                return
-            content = self.get_content()
-            if not force:
-                valid, err = self._check_content(content)
-                if not valid:
-                    self.status_msg = err
-                    return
-            save = self._pretty_to_jsonl(content) if self.jsonl else content
-            self.post_message(
-                self.FileSaveRequested(content=save, file_path=arg)
-            )
-        elif verb == "q":
-            if force:
-                self.post_message(self.ForceQuit())
-            else:
-                self.post_message(self.Quit())
-        elif verb in ("wq", "x"):
-            if self.read_only:
-                # read-only: just quit without saving
-                self.post_message(self.Quit())
-                return
-            content = self.get_content()
-            if not force:
-                valid, err = self._check_content(content)
-                if not valid:
-                    self.status_msg = err
-                    return
-            save = self._pretty_to_jsonl(content) if self.jsonl else content
-            self.post_message(
-                self.FileSaveRequested(
-                    content=save, file_path=arg, quit_after=True
-                )
-            )
-        elif verb == "e":
-            if not arg:
-                self.status_msg = "Usage: :e <file>"
-            else:
-                self.post_message(self.FileOpenRequested(file_path=arg))
-        elif verb in ("fmt", "format"):
-            if self.read_only:
-                self.status_msg = "[readonly]"
-            else:
-                self._format_json()
-        elif verb == "help":
-            self.post_message(self.HelpToggleRequested())
-        else:
-            self.status_msg = f"unknown command: :{cmd}"
-
-    # -- SEARCH ------------------------------------------------------------
-
-    def _handle_search(self, event: events.Key) -> None:
-        key = event.key
-        char = event.character
-
-        if key == "escape":
-            self._mode = EditorMode.NORMAL
-            self._search_buffer = ""
-            self._search_history_idx = -1
-            self.status_msg = ""
-            return
-
-        if key == "enter":
-            if self._search_buffer:
-                self._add_to_search_history(self._search_buffer)
-                self._execute_search()
-            self._mode = EditorMode.NORMAL
-            self._search_history_idx = -1
-            return
-
-        if key == "backspace":
-            if self._search_buffer:
-                self._search_buffer = self._search_buffer[:-1]
-                self._search_history_idx = -1  # Reset history navigation on edit
-            else:
-                self._mode = EditorMode.NORMAL
-                self._search_history_idx = -1
-            return
-
-        # History navigation
-        if key == "up":
-            self._search_history_prev()
-            return
-        if key == "down":
-            self._search_history_next()
-            return
-
-        if char and char.isprintable():
-            self._search_buffer += char
-            self._search_history_idx = -1  # Reset history navigation on edit
-
-    def _add_to_search_history(self, pattern: str) -> None:
-        """Add pattern to search history, avoiding duplicates."""
-        if not pattern:
-            return
-        # Remove if already exists (to move to front)
-        if pattern in self._search_history:
-            self._search_history.remove(pattern)
-        # Add to front
-        self._search_history.insert(0, pattern)
-        # Trim to max size
-        if len(self._search_history) > self._search_history_max:
-            self._search_history.pop()
-
-    def _search_history_prev(self) -> None:
-        """Navigate to previous search in history."""
-        if not self._search_history:
-            return
-        if self._search_history_idx < len(self._search_history) - 1:
-            self._search_history_idx += 1
-            self._search_buffer = self._search_history[self._search_history_idx]
-
-    def _search_history_next(self) -> None:
-        """Navigate to next search in history."""
-        if self._search_history_idx > 0:
-            self._search_history_idx -= 1
-            self._search_buffer = self._search_history[self._search_history_idx]
-        elif self._search_history_idx == 0:
-            self._search_history_idx = -1
-            self._search_buffer = ""
-
-    def _build_search_row_index(self) -> None:
-        """Build row-indexed lookup for search matches."""
-        self._search_match_by_row = {}
-        for mi, (row, start, end) in enumerate(self._search_matches):
-            if row not in self._search_match_by_row:
-                self._search_match_by_row[row] = []
-            self._search_match_by_row[row].append((start, end, mi))
-
-    def _execute_search(self) -> None:
-        """Execute search and find all matches."""
-
-        pattern = self._search_buffer
-        self._search_pattern = pattern
-
-        # Check for JSONPath: explicit \j suffix or pattern starting with $. or $[
-        if pattern.endswith("\\j"):
-            self._execute_jsonpath_search(pattern[:-2])
-            return
-        if pattern.startswith("$.") or pattern.startswith("$["):
-            self._execute_jsonpath_search(pattern)
-            return
-
-        # Check for case sensitivity flags
-        flags = 0
-        if pattern.endswith("\\c"):
-            pattern = pattern[:-2]
-            flags = re.IGNORECASE
-        elif pattern.endswith("\\C"):
-            pattern = pattern[:-2]
-        elif pattern.islower():
-            # Smart case: case insensitive if all lowercase
-            flags = re.IGNORECASE
-
-        self._search_matches = []
-        try:
-            regex = re.compile(pattern, flags)
-        except re.error as e:
-            self.status_msg = f"Invalid pattern: {e}"
-            return
-
-        # Find all matches
-        for row, line in enumerate(self.lines):
-            for match in regex.finditer(line):
-                self._search_matches.append((row, match.start(), match.end()))
-        self._build_search_row_index()
-
-        if not self._search_matches:
-            self.status_msg = f"Pattern not found: {self._search_pattern}"
-            self._current_match = -1
-            return
-
-        # Find the first match after cursor (for forward) or before cursor (for backward)
-        self._current_match = self._find_match_near_cursor()
-        self._goto_current_match()
-
-    def _parse_jsonpath_filter(self, pattern: str) -> tuple[str, str, any]:
-        """Parse JSONPath with optional value filter.
-
-        Supports:
-          $.path=value    (equals)
-          $.path!=value   (not equals)
-          $.path>value    (greater than)
-          $.path<value    (less than)
-          $.path>=value   (greater or equal)
-          $.path<=value   (less or equal)
-          $.path~regex    (regex match)
-
-        Returns (path, operator, value) or (path, "", None) if no filter.
-        """
-
-        # Order matters: check longer operators first
-        operators = ["!=", ">=", "<=", "~", "=", ">", "<"]
-        for op in operators:
-            # Find operator not inside brackets
-            idx = 0
-            bracket_depth = 0
-            while idx < len(pattern):
-                ch = pattern[idx]
-                if ch == "[":
-                    bracket_depth += 1
-                elif ch == "]":
-                    bracket_depth -= 1
-                elif bracket_depth == 0 and pattern[idx:].startswith(op):
-                    path = pattern[:idx]
-                    value_str = pattern[idx + len(op):]
-                    value = self._parse_json_value(value_str)
-                    return (path, op, value)
-                idx += 1
-
-        return (pattern, "", None)
-
-    def _parse_json_value(self, value_str: str) -> any:
-        """Parse a value string into Python object."""
-        value_str = value_str.strip()
-        if not value_str:
-            return None
-
-        # Try JSON parsing first (handles strings, numbers, booleans, null)
-        try:
-            return json.loads(value_str)
-        except json.JSONDecodeError:
-            pass
-
-        # Handle single-quoted strings
-        if len(value_str) >= 2 and value_str[0] == "'" and value_str[-1] == "'":
-            return value_str[1:-1]
-
-        # Unquoted string - treat as string
-        return value_str
-
-    def _jsonpath_value_matches(self, actual: any, op: str, expected: any) -> bool:
-        """Check if actual value matches the expected value with given operator."""
-
-        if op == "=" or op == "==":
-            return actual == expected
-        elif op == "!=":
-            return actual != expected
-        elif op == ">":
+        # EJ editor: update parent and close/pop panel
+        if self._is_ej_editor_focused() and self._ej_stack:
+            row, col_start, col_end, prev_content, _ = self._ej_stack.pop()
+            # Minify the JSON to a single line
             try:
-                return actual > expected
-            except TypeError:
-                return False
-        elif op == "<":
-            try:
-                return actual < expected
-            except TypeError:
-                return False
-        elif op == ">=":
-            try:
-                return actual >= expected
-            except TypeError:
-                return False
-        elif op == "<=":
-            try:
-                return actual <= expected
-            except TypeError:
-                return False
-        elif op == "~":
-            # Regex match
-            if not isinstance(actual, str):
-                actual = str(actual)
-            pattern = expected if isinstance(expected, str) else str(expected)
-            try:
-                return bool(re.search(pattern, actual))
-            except re.error:
-                return False
-        return False
-
-    def _get_value_at_path(self, data: any, path: list[str | int]) -> any:
-        """Get the value at a given path in data."""
-        current = data
-        for key in path:
-            if isinstance(current, dict) and key in current:
-                current = current[key]
-            elif isinstance(current, list) and isinstance(key, int):
-                if 0 <= key < len(current):
-                    current = current[key]
-                else:
-                    return None
-            else:
-                return None
-        return current
-
-    def _execute_jsonpath_search(self, path: str) -> None:
-        """Execute JSONPath search and find all matches."""
-        # JSONL mode: search in each record separately
-        if self.jsonl:
-            self._execute_jsonpath_search_jsonl(path)
-            return
-
-        # Parse filter if present
-        jsonpath, op, filter_value = self._parse_jsonpath_filter(path)
-
-        content = self.get_content()
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as e:
-            self.status_msg = f"Invalid JSON: {e.msg} (line {e.lineno})"
-            return
-
-        # Parse and execute JSONPath
-        try:
-            results = self._jsonpath_find(data, jsonpath)
-        except ValueError as e:
-            self.status_msg = f"Invalid JSONPath: {e}"
-            return
-
-        # Filter by value if operator present
-        if op:
-            results = [
-                p for p in results
-                if self._jsonpath_value_matches(
-                    self._get_value_at_path(data, p), op, filter_value
-                )
-            ]
-
-        if not results:
-            self.status_msg = f"JSONPath not found: {path}"
-            self._search_matches = []
-            self._search_match_by_row = {}
-            self._current_match = -1
-            return
-
-        # Build key index once for fast lookup
-        key_index = self._build_key_index()
-
-        # Convert JSONPath results to text positions
-        self._search_matches = []
-        for json_path in results:
-            pos = self._find_json_value_position_fast(data, json_path, key_index)
-            if pos:
-                self._search_matches.append(pos)
-        self._build_search_row_index()
-
-        if not self._search_matches:
-            self.status_msg = "JSONPath matched but positions not found"
-            self._current_match = -1
-            return
-
-        self._current_match = self._find_match_near_cursor()
-        self._goto_current_match()
-
-    def _execute_jsonpath_search_jsonl(self, path: str) -> None:
-        """Execute JSONPath search across JSONL records."""
-        # Parse filter if present
-        jsonpath, op, filter_value = self._parse_jsonpath_filter(path)
-
-        blocks = self._split_jsonl_blocks(self.get_content())
-
-        if not blocks:
-            self.status_msg = "No JSONL records found"
-            self._search_matches = []
-            self._current_match = -1
-            return
-
-        # Pre-compute block start lines once
-        block_start_lines = self._compute_block_start_lines()
-
-        # Find all matches with their block data
-        all_results: list[tuple[int, any, list[str | int]]] = []  # (block_idx, data, path)
-        for block_idx, block in enumerate(blocks):
-            try:
-                data = json.loads(block)
+                parsed = json.loads(event.content)
+                minified = json.dumps(parsed, ensure_ascii=False)
             except json.JSONDecodeError:
-                continue
-
-            try:
-                results = self._jsonpath_find(data, jsonpath)
-                for json_path in results:
-                    # Filter by value if operator present
-                    if op:
-                        actual = self._get_value_at_path(data, json_path)
-                        if not self._jsonpath_value_matches(actual, op, filter_value):
-                            continue
-                    all_results.append((block_idx, data, json_path))
-            except ValueError:
-                if block_idx == 0:
-                    self.status_msg = f"Invalid JSONPath: {jsonpath}"
-                    self._search_matches = []
-                    self._current_match = -1
-                    return
-
-        if not all_results:
-            self.status_msg = f"JSONPath not found: {path}"
-            self._search_matches = []
-            self._search_match_by_row = {}
-            self._current_match = -1
-            return
-
-        # Build key index once
-        key_index = self._build_key_index()
-
-        # Convert to text positions
-        self._search_matches = []
-        for block_idx, data, json_path in all_results:
-            start_line = block_start_lines.get(block_idx, 0)
-            pos = self._find_json_value_position_fast(data, json_path, key_index, start_line)
-            if pos:
-                self._search_matches.append(pos)
-        self._build_search_row_index()
-
-        if not self._search_matches:
-            self.status_msg = "JSONPath matched but positions not found"
-            self._current_match = -1
-            return
-
-        self._current_match = self._find_match_near_cursor()
-        self._goto_current_match()
-
-    def _build_key_index(self) -> dict[str, list[tuple[int, int]]]:
-        """Build an index of JSON keys to their (row, col) positions."""
-        index: dict[str, list[tuple[int, int]]] = {}
-        for row, line in enumerate(self.lines):
-            col = 0
-            while col < len(line):
-                # Find start of string (potential key)
-                quote_pos = line.find('"', col)
-                if quote_pos == -1:
-                    break
-                # Find end of string
-                end_pos = quote_pos + 1
-                while end_pos < len(line):
-                    if line[end_pos] == '"' and line[end_pos - 1] != '\\':
-                        break
-                    end_pos += 1
-                if end_pos >= len(line):
-                    break
-                # Check if followed by colon (it's a key)
-                after = end_pos + 1
-                while after < len(line) and line[after] in ' \t':
-                    after += 1
-                if after < len(line) and line[after] == ':':
-                    key = line[quote_pos:end_pos + 1]  # Include quotes
-                    if key not in index:
-                        index[key] = []
-                    index[key].append((row, quote_pos))
-                col = end_pos + 1
-        return index
-
-    def _compute_block_start_lines(self) -> dict[int, int]:
-        """Compute the starting line number for each JSONL block."""
-        result: dict[int, int] = {}
-        block_idx = 0
-        in_block = False
-        for i, line in enumerate(self.lines):
-            if line.strip():
-                if not in_block:
-                    result[block_idx] = i
-                    block_idx += 1
-                    in_block = True
-            else:
-                in_block = False
-        return result
-
-    def _find_json_value_position_fast(
-        self,
-        data: any,
-        path: list[str | int],
-        key_index: dict[str, list[tuple[int, int]]],
-        start_line: int = 0,
-    ) -> tuple[int, int, int] | None:
-        """Find text position using pre-built key index."""
-        # Navigate to find the value
-        current = data
-        for key in path:
-            if isinstance(current, dict):
-                if key not in current:
-                    return None
-                current = current[key]
-            elif isinstance(current, list) and isinstance(key, int):
-                if 0 <= key < len(current):
-                    current = current[key]
-                else:
-                    return None
-            else:
-                return None
-
-        is_complex = isinstance(current, (dict, list))
-
-        # Find position using key index
-        if path:
-            last_key = path[-1]
-            if isinstance(last_key, str):
-                key_pattern = json.dumps(last_key, ensure_ascii=False)
-                positions = key_index.get(key_pattern, [])
-
-                # Find the first position at or after start_line
-                for row, col in positions:
-                    if row >= start_line:
-                        if is_complex:
-                            # Highlight the key
-                            return (row, col, col + len(key_pattern))
-                        else:
-                            # Highlight the value
-                            line = self.lines[row]
-                            value_start = col + len(key_pattern)
-                            # Skip ": "
-                            while value_start < len(line) and line[value_start] in ': \t':
-                                value_start += 1
-                            target_str = json.dumps(current, ensure_ascii=False)
-                            if line[value_start:].startswith(target_str):
-                                return (row, value_start, value_start + len(target_str))
-                            # Fallback: find value length by parsing
-                            value_end = self._find_value_end(line, value_start)
-                            if value_end > value_start:
-                                return (row, value_start, value_end)
-                return None
-            else:
-                # Array index - find value directly
-                if is_complex:
-                    return None
-                target_str = json.dumps(current, ensure_ascii=False)
-                for row in range(start_line, len(self.lines)):
-                    line = self.lines[row]
-                    pos = line.find(target_str)
-                    if pos >= 0:
-                        return (row, pos, pos + len(target_str))
-                return None
-        return None
-
-    def _find_value_end(self, line: str, start: int) -> int:
-        """Find the end position of a JSON value starting at start."""
-        if start >= len(line):
-            return start
-        ch = line[start]
-        if ch == '"':
-            # String - find closing quote
-            i = start + 1
-            while i < len(line):
-                if line[i] == '"' and line[i - 1] != '\\':
-                    return i + 1
-                i += 1
-            return len(line)
-        elif ch in '-0123456789':
-            # Number
-            i = start + 1
-            while i < len(line) and line[i] in '0123456789.eE+-':
-                i += 1
-            return i
-        elif line[start:start + 4] == 'true':
-            return start + 4
-        elif line[start:start + 5] == 'false':
-            return start + 5
-        elif line[start:start + 4] == 'null':
-            return start + 4
-        return start
-
-    def _jsonpath_find(self, data: any, path: str) -> list[list[str | int]]:
-        """
-        Simple JSONPath implementation supporting:
-        - $ (root)
-        - .key (child)
-        - [n] (array index)
-        - [*] (wildcard)
-        - .. (recursive descent)
-
-        Returns list of paths (each path is list of keys/indices).
-        """
-        if not path.startswith("$"):
-            raise ValueError("JSONPath must start with $")
-
-        path = path[1:]  # Remove $
-        results: list[list[str | int]] = []
-        self._jsonpath_traverse(data, path, [], results)
-        return results
-
-    def _jsonpath_traverse(
-        self,
-        data: any,
-        remaining_path: str,
-        current_path: list[str | int],
-        results: list[list[str | int]],
-    ) -> None:
-        """Traverse JSON data following the path pattern."""
-        # Base case: no more path to traverse
-        if not remaining_path:
-            results.append(current_path.copy())
-            return
-
-        # Handle recursive descent (..)
-        if remaining_path.startswith(".."):
-            rest = remaining_path[2:]
-            # Extract next key/pattern
-            next_key, after = self._jsonpath_next_segment(rest)
-            if next_key is not None:
-                # Search recursively
-                self._jsonpath_recursive_descent(data, next_key, after, current_path, results)
-            return
-
-        # Handle dot notation (.key)
-        if remaining_path.startswith("."):
-            rest = remaining_path[1:]
-            key, after = self._jsonpath_next_segment(rest)
-            if key is None:
+                self.notify("Invalid JSON", severity="error")
+                # Restore the popped entry with current content as new original
+                self._ej_stack.append((row, col_start, col_end, prev_content, event.content))
                 return
 
-            if key == "*":
-                # Wildcard: match all children
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        self._jsonpath_traverse(v, after, current_path + [k], results)
-                elif isinstance(data, list):
-                    for i, v in enumerate(data):
-                        self._jsonpath_traverse(v, after, current_path + [i], results)
-            elif isinstance(data, dict) and key in data:
-                self._jsonpath_traverse(data[key], after, current_path + [key], results)
-            return
-
-        # Handle bracket notation ([n] or [*])
-        if remaining_path.startswith("["):
-            end = remaining_path.find("]")
-            if end == -1:
-                raise ValueError("Unclosed bracket")
-
-            index_str = remaining_path[1:end]
-            after = remaining_path[end + 1:]
-
-            if index_str == "*":
-                # Wildcard
-                if isinstance(data, list):
-                    for i, v in enumerate(data):
-                        self._jsonpath_traverse(v, after, current_path + [i], results)
-                elif isinstance(data, dict):
-                    for k, v in data.items():
-                        self._jsonpath_traverse(v, after, current_path + [k], results)
-            elif index_str.lstrip("-").isdigit():
-                # Numeric index
-                idx = int(index_str)
-                if isinstance(data, list) and -len(data) <= idx < len(data):
-                    self._jsonpath_traverse(data[idx], after, current_path + [idx], results)
+            if self._ej_stack:
+                # Update previous ej content and show it
+                ej_editor = self.query_one("#ej-editor", JsonEditor)
+                lines = prev_content.split("\n")
+                line = lines[row]
+                escaped = json.dumps(minified, ensure_ascii=False)
+                lines[row] = line[:col_start] + escaped + line[col_end:]
+                new_content = "\n".join(lines)
+                ej_editor.set_content(new_content)
+                # Keep original content unchanged so modified indicator stays
+                self._update_ej_title()
+                self.notify("Embedded JSON updated", severity="information")
             else:
-                # String key in brackets
-                key = index_str.strip("'\"")
-                if isinstance(data, dict) and key in data:
-                    self._jsonpath_traverse(data[key], after, current_path + [key], results)
+                # Update main editor and restore its read-only state
+                main_editor = self.query_one("#editor", JsonEditor)
+                main_editor.read_only = self._main_was_read_only
+                main_editor.update_embedded_string(row, col_start, col_end, minified)
+                self.notify("Embedded JSON updated", severity="information")
+                if event.quit_after:
+                    self.query_one("#ej-panel").remove_class("visible")
+                    main_editor._scroll_top = self._main_scroll_top
+                    main_editor.focus()
             return
 
-    def _jsonpath_next_segment(self, path: str) -> tuple[str | None, str]:
-        """Extract the next segment from path. Returns (segment, remaining)."""
-        if not path:
-            return None, ""
+        target = event.file_path or self.file_path
+        if not target:
+            self.notify("No file name — use :w <file>", severity="warning")
+            return
 
-        if path.startswith("["):
-            end = path.find("]")
-            if end == -1:
-                return None, path
-            return path[1:end], path[end + 1:]
+        try:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(event.content, encoding="utf-8")
+            self.file_path = str(path)
+            self._update_title()
+            self.notify(f"Saved: {self.file_path}", severity="information")
+            if event.quit_after:
+                self._save_and_exit()
+        except OSError as exc:
+            self.notify(f"Save failed: {exc}", severity="error", timeout=6)
 
-        if path.startswith("."):
-            return None, path
-
-        # Find end of key (next . or [)
-        end = len(path)
-        for i, ch in enumerate(path):
-            if ch in ".[]":
-                end = i
-                break
-
-        return path[:end], path[end:]
-
-    def _jsonpath_recursive_descent(
-        self,
-        data: any,
-        target_key: str,
-        remaining_path: str,
-        current_path: list[str | int],
-        results: list[list[str | int]],
+    def on_json_editor_file_open_requested(
+        self, event: JsonEditor.FileOpenRequested
     ) -> None:
-        """Recursively search for target_key in data."""
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if target_key == "*" or k == target_key:
-                    self._jsonpath_traverse(v, remaining_path, current_path + [k], results)
-                # Continue descent
-                self._jsonpath_recursive_descent(v, target_key, remaining_path, current_path + [k], results)
-        elif isinstance(data, list):
-            for i, v in enumerate(data):
-                # Continue descent into array elements
-                self._jsonpath_recursive_descent(v, target_key, remaining_path, current_path + [i], results)
+        target = event.file_path
+        try:
+            content = Path(target).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self.notify(f"File not found: {target}", severity="error", timeout=6)
+            return
+        except OSError as exc:
+            self.notify(f"Cannot open: {exc}", severity="error", timeout=6)
+            return
 
-    def _find_match_near_cursor(self) -> int:
-        """Find the index of the match nearest to cursor in search direction."""
-        if not self._search_matches:
-            return -1
+        editor = self.query_one("#editor", JsonEditor)
+        editor.set_content(content)
+        self.jsonl = target.lower().endswith(".jsonl")
+        editor.jsonl = self.jsonl
+        self.file_path = target
+        self._update_title()
+        self.notify(f"Opened: {target}", severity="information")
 
-        cursor_pos = (self.cursor_row, self.cursor_col)
-
-        if self._search_forward:
-            # Find first match at or after cursor
-            for i, (row, col_start, _) in enumerate(self._search_matches):
-                if (row, col_start) >= cursor_pos:
-                    return i
-            # Wrap around to beginning
-            return 0
+    def on_json_editor_help_toggle_requested(self) -> None:
+        help_panel = self.query_one("#help-panel")
+        help_panel.toggle_class("visible")
+        if help_panel.has_class("visible"):
+            self.query_one("#help-editor").focus()
         else:
-            # Find last match at or before cursor
-            for i in range(len(self._search_matches) - 1, -1, -1):
-                row, col_start, _ = self._search_matches[i]
-                if (row, col_start) <= cursor_pos:
-                    return i
-            # Wrap around to end
-            return len(self._search_matches) - 1
+            self.query_one("#editor").focus()
 
-    def _goto_current_match(self) -> None:
-        """Move cursor to the current match and update status."""
-        if not self._search_matches or self._current_match < 0:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.query_one("#help-panel").remove_class("visible")
+            self.query_one("#editor").focus()
+        elif event.button.id == "ej-close":
+            self._close_ej_panel()
+
+    def _ej_has_unsaved_changes(self) -> bool:
+        """Check if current ej content differs from original."""
+        if not self._ej_stack:
+            return False
+        ej_editor = self.query_one("#ej-editor", JsonEditor)
+        current = ej_editor.get_content()
+        _, _, _, _, original = self._ej_stack[-1]
+        return current != original
+
+    def _update_ej_title(self) -> None:
+        """Update ej panel title with current nesting level and modified indicator."""
+        level = len(self._ej_stack)
+        title = self.query_one("#ej-title", Static)
+        modified = " [+]" if self._ej_has_unsaved_changes() else ""
+        title.update(f"[b]Edit Embedded JSON[/b] [dim](level {level}){modified}[/dim]")
+
+    def _close_ej_panel(self) -> None:
+        """Close or pop one level of ej editing."""
+        if not self._ej_stack:
+            self.query_one("#ej-panel").remove_class("visible")
+            main_editor = self.query_one("#editor", JsonEditor)
+            main_editor.read_only = self._main_was_read_only
+            main_editor._scroll_top = self._main_scroll_top
+            main_editor.focus()
             return
 
-        row, col_start, _ = self._search_matches[self._current_match]
-        self._unfold_for_line(row)
-        self.cursor_row = row
-        self.cursor_col = col_start
-        self._scroll_cursor_to_center()
-        total = len(self._search_matches)
-        self.status_msg = f"/{self._search_pattern}  [{self._current_match + 1}/{total}]"
+        # Pop current level and get content to restore
+        _, _, _, restore_content, _ = self._ej_stack.pop()
 
-    def _goto_next_match(self) -> None:
-        """Go to the next search match."""
-        if not self._search_matches:
-            if self._search_pattern:
-                self.status_msg = f"Pattern not found: {self._search_pattern}"
-            else:
-                self.status_msg = "No previous search"
-            return
-
-        # Move cursor slightly forward to avoid staying on current match
-        self.cursor_col += 1
-        self._current_match = self._find_match_near_cursor()
-        self._goto_current_match()
-
-    def _goto_prev_match(self) -> None:
-        """Go to the previous search match."""
-        if not self._search_matches:
-            if self._search_pattern:
-                self.status_msg = f"Pattern not found: {self._search_pattern}"
-            else:
-                self.status_msg = "No previous search"
-            return
-
-        # Move cursor slightly backward to avoid staying on current match
-        self.cursor_col -= 1
-        if self.cursor_col < 0:
-            self.cursor_row -= 1
-            if self.cursor_row < 0:
-                self.cursor_row = len(self.lines) - 1
-            self.cursor_col = len(self.lines[self.cursor_row])
-
-        # Find match before cursor
-        cursor_pos = (self.cursor_row, self.cursor_col)
-        found = -1
-        for i in range(len(self._search_matches) - 1, -1, -1):
-            row, col_start, _ = self._search_matches[i]
-            if (row, col_start) <= cursor_pos:
-                found = i
-                break
-
-        if found >= 0:
-            self._current_match = found
+        if self._ej_stack:
+            # Restore previous level content
+            ej_editor = self.query_one("#ej-editor", JsonEditor)
+            ej_editor.set_content(restore_content)
+            self._update_ej_title()
         else:
-            # Wrap around to last match
-            self._current_match = len(self._search_matches) - 1
+            # No more levels, close panel and restore main editor state
+            self.query_one("#ej-panel").remove_class("visible")
+            main_editor = self.query_one("#editor", JsonEditor)
+            main_editor.read_only = self._main_was_read_only
+            main_editor._scroll_top = self._main_scroll_top
+            main_editor.focus()
 
-        self._goto_current_match()
-
-    # -- JSON operations ---------------------------------------------------
-
-    def _check_content(self, content: str) -> tuple[bool, str]:
-        """Validate content as JSON or JSONL. Returns (valid, error_msg)."""
-        if self.jsonl:
-            blocks = self._split_jsonl_blocks(content)
-            for i, block in enumerate(blocks, 1):
-                try:
-                    json.loads(block)
-                except json.JSONDecodeError as e:
-                    return False, f"JSONL error: record {i}: {e.msg}"
-            return True, ""
-        try:
-            json.loads(content)
-            return True, ""
-        except json.JSONDecodeError as e:
-            return False, f"JSON error: {e.msg} (line {e.lineno})"
-
-    def _validate_json(self) -> bool:
-        content = self.get_content()
-        valid, err = self._check_content(content)
-        if valid:
-            label = "JSONL" if self.jsonl else "JSON"
-            self.status_msg = f"{label} valid"
-            self.post_message(self.JsonValidated(content=content, valid=True))
-            return True
-        self.status_msg = err
-        self.post_message(
-            self.JsonValidated(content=content, valid=False, error=err)
-        )
-        return False
-
-    def _format_json(self) -> None:
-        if self.jsonl:
-            self._format_jsonl()
-            return
-        content = self.get_content()
-        try:
-            parsed = json.loads(content)
-            formatted = json.dumps(parsed, indent=4, ensure_ascii=False)
-            self._save_undo()
-            self.lines = formatted.split("\n")
-            self.cursor_row = 0
-            self.cursor_col = 0
-            self._folds.clear()
-            self._collapsed_strings.clear()
-            self.status_msg = "formatted"
-        except json.JSONDecodeError as e:
-            self.status_msg = f"cannot format: {e.msg} (line {e.lineno})"
-
-    def _format_jsonl(self) -> None:
-        content = self.get_content()
-        blocks = self._split_jsonl_blocks(content)
-        formatted: list[str] = []
-        for i, block in enumerate(blocks):
-            try:
-                parsed = json.loads(block)
-                formatted.append(json.dumps(parsed, indent=4, ensure_ascii=False))
-            except json.JSONDecodeError as e:
-                self.status_msg = f"cannot format: record {i + 1}: {e.msg}"
-                return
-        self._save_undo()
-        self.lines = "\n\n".join(formatted).split("\n")
-        self.cursor_row = 0
-        self.cursor_col = 0
-        self.status_msg = "formatted"
-
-    def _find_string_at_cursor(self) -> tuple[int, int, str] | None:
-        """Find a string value on the current line.
-
-        Returns (col_start, col_end, string_content) or None if no string value found.
-        col_start and col_end include the quotes.
-        """
-        line = self.lines[self.cursor_row]
-
-        # Parse all strings on this line with their positions
-        strings: list[tuple[int, int, str]] = []  # (start, end, content)
-        i = 0
-        while i < len(line):
-            if line[i] == '"':
-                start = i
-                i += 1
-                while i < len(line):
-                    if line[i] == '"' and line[i - 1] != '\\':
-                        raw = line[start + 1:i]
-                        try:
-                            content = json.loads(f'"{raw}"')
-                            strings.append((start, i + 1, content))
-                        except json.JSONDecodeError:
-                            pass
-                        break
-                    i += 1
-            i += 1
-
-        if not strings:
-            return None
-
-        # Find string values (strings that follow a ':')
-        for start, end, content in strings:
-            before = line[:start].rstrip()
-            if before.endswith(':'):
-                return (start, end, content)
-
-        return None
-
-    def _edit_embedded_json(self) -> None:
-        """Handle :ej command to edit embedded JSON string."""
-        result = self._find_string_at_cursor()
-        if result is None:
-            self.status_msg = "cursor not on a string value"
-            return
-
-        col_start, col_end, content = result
-
-        # Try to parse as JSON
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            self.status_msg = "string is not valid JSON"
-            return
-
-        # Check if it's a list or dict
-        if not isinstance(parsed, (list, dict)):
-            self.status_msg = "string is not a list or dict"
-            return
-
-        # Format and send for editing
-        formatted = json.dumps(parsed, indent=4, ensure_ascii=False)
-        self.post_message(
-            self.EmbeddedEditRequested(
-                content=formatted,
-                source_row=self.cursor_row,
-                source_col_start=col_start,
-                source_col_end=col_end,
-            )
-        )
-
-    def update_embedded_string(
-        self, row: int, col_start: int, col_end: int, new_content: str
+    def on_json_editor_embedded_edit_requested(
+        self, event: JsonEditor.EmbeddedEditRequested
     ) -> None:
-        """Update a string value with new JSON content."""
-        self._save_undo()
-        # Escape the new content as a JSON string
-        escaped = json.dumps(new_content, ensure_ascii=False)
-        line = self.lines[row]
-        self.lines[row] = line[:col_start] + escaped + line[col_end:]
-        self.refresh()
+        ej_editor = self.query_one("#ej-editor", JsonEditor)
 
-    # -- JSONL helpers -----------------------------------------------------
-
-    @staticmethod
-    def _jsonl_to_pretty(content: str) -> str:
-        """Convert JSONL (one-json-per-line) to pretty-printed blocks."""
-        blocks: list[str] = []
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                parsed = json.loads(stripped)
-                blocks.append(json.dumps(parsed, indent=4, ensure_ascii=False))
-            except json.JSONDecodeError:
-                blocks.append(stripped)
-        return "\n\n".join(blocks)
-
-    @staticmethod
-    def _split_jsonl_blocks(content: str) -> list[str]:
-        """Split pretty-printed content into blocks separated by blank lines."""
-        blocks: list[str] = []
-        current: list[str] = []
-        for line in content.split("\n"):
-            if line.strip():
-                current.append(line)
-            else:
-                if current:
-                    blocks.append("\n".join(current))
-                    current = []
-        if current:
-            blocks.append("\n".join(current))
-        return blocks
-
-    @staticmethod
-    def _pretty_to_jsonl(content: str) -> str:
-        """Convert pretty-printed blocks back to JSONL (one-json-per-line)."""
-        blocks = JsonEditor._split_jsonl_blocks(content)
-        lines: list[str] = []
-        for block in blocks:
-            try:
-                parsed = json.loads(block)
-                lines.append(json.dumps(parsed, ensure_ascii=False))
-            except json.JSONDecodeError:
-                lines.append(" ".join(block.split()))
-        return "\n".join(lines)
-
-    # -- Movement helpers --------------------------------------------------
-
-    def _current_indent(self) -> int:
-        line = self.lines[self.cursor_row]
-        return len(line) - len(line.lstrip()) if line.strip() else 0
-
-    def _move_word_forward(self) -> None:
-        line = self.lines[self.cursor_row]
-        col = self.cursor_col
-        while col < len(line) and (line[col].isalnum() or line[col] == "_"):
-            col += 1
-        while col < len(line) and not (line[col].isalnum() or line[col] == "_"):
-            col += 1
-        if col >= len(line) and self.cursor_row < len(self.lines) - 1:
-            self.cursor_row += 1
-            nline = self.lines[self.cursor_row]
-            self.cursor_col = len(nline) - len(nline.lstrip())
+        if self._is_ej_editor_focused():
+            # Nested ej from ej panel - push to stack
+            current_content = ej_editor.get_content()
+            self._ej_stack.append((
+                event.source_row,
+                event.source_col_start,
+                event.source_col_end,
+                current_content,
+                event.content,  # original content for change detection
+            ))
         else:
-            self.cursor_col = min(col, max(0, len(line) - 1))
+            # From main editor - reset stack to level 1
+            main_editor = self.query_one("#editor", JsonEditor)
+            self._main_was_read_only = main_editor.read_only
+            self._main_scroll_top = main_editor._scroll_top
+            main_editor.read_only = True
+            self._ej_stack = [(
+                event.source_row,
+                event.source_col_start,
+                event.source_col_end,
+                "",  # No previous ej content
+                event.content,  # original content for change detection
+            )]
 
-    def _move_word_backward(self) -> None:
-        line = self.lines[self.cursor_row]
-        col = self.cursor_col
-        if col == 0:
-            if self.cursor_row > 0:
-                self.cursor_row -= 1
-                self.cursor_col = max(0, len(self.lines[self.cursor_row]) - 1)
-            return
-        col -= 1
-        while col > 0 and not (line[col].isalnum() or line[col] == "_"):
-            col -= 1
-        while col > 0 and (line[col - 1].isalnum() or line[col - 1] == "_"):
-            col -= 1
-        self.cursor_col = col
+        # Set content and show panel
+        ej_editor.set_content(event.content)
+        self._update_ej_title()
+        self.query_one("#ej-panel").add_class("visible")
+        ej_editor.focus()
 
-    def _jump_matching_bracket(self) -> None:
-        line = self.lines[self.cursor_row]
-        if self.cursor_col >= len(line):
-            return
-        ch = line[self.cursor_col]
-        if ch in self._BRACKET_PAIRS:
-            self._search_bracket_forward(ch, self._BRACKET_PAIRS[ch])
-        elif ch in self._BRACKET_PAIRS_REV:
-            self._search_bracket_backward(ch, self._BRACKET_PAIRS_REV[ch])
 
-    def _search_bracket_forward(self, open_ch: str, close_ch: str) -> None:
-        depth = 1
-        row, col = self.cursor_row, self.cursor_col + 1
-        while row < len(self.lines):
-            line = self.lines[row]
-            while col < len(line):
-                if line[col] == open_ch:
-                    depth += 1
-                elif line[col] == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        self.cursor_row, self.cursor_col = row, col
-                        return
-                col += 1
-            row += 1
-            col = 0
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="jvim",
+        description="JSON editor with vim-style keybindings",
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default="",
+        help="JSON file to open",
+    )
+    parser.add_argument(
+        "-R", "--read-only",
+        action="store_true",
+        default=False,
+        help="open in read-only mode",
+    )
+    args = parser.parse_args()
 
-    def _search_bracket_backward(self, close_ch: str, open_ch: str) -> None:
-        depth = 1
-        row, col = self.cursor_row, self.cursor_col - 1
-        while row >= 0:
-            line = self.lines[row]
-            while col >= 0:
-                if line[col] == close_ch:
-                    depth += 1
-                elif line[col] == open_ch:
-                    depth -= 1
-                    if depth == 0:
-                        self.cursor_row, self.cursor_col = row, col
-                        return
-                col -= 1
-            row -= 1
-            if row >= 0:
-                col = len(self.lines[row]) - 1
+    file_path: str = args.file
+    initial_content: str = _load_data("sample.json")
+    jsonl: bool = file_path.lower().endswith(".jsonl") if file_path else False
 
-    # -- Folding -----------------------------------------------------------
-
-    def _find_matching_bracket_forward(self, row: int, col: int) -> tuple[int, int] | None:
-        """_search_bracket_forward와 동일하나 커서를 변경하지 않고 위치만 반환."""
-        line = self.lines[row]
-        if col >= len(line):
-            return None
-        open_ch = line[col]
-        close_ch = self._BRACKET_PAIRS.get(open_ch)
-        if close_ch is None:
-            return None
-        depth = 1
-        r, c = row, col + 1
-        while r < len(self.lines):
-            ln = self.lines[r]
-            while c < len(ln):
-                if ln[c] == open_ch:
-                    depth += 1
-                elif ln[c] == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return (r, c)
-                c += 1
-            r += 1
-            c = 0
-        return None
-
-    def _find_foldable_at(self, line_idx: int) -> tuple[int, int] | None:
-        """line_idx에서 시작하는 fold 가능 범위를 반환. 없으면 None."""
-        line = self.lines[line_idx]
-        stripped = line.rstrip()
-        if not stripped:
-            return None
-        last_ch = stripped[-1]
-        if last_ch in ("{", "["):
-            col = len(stripped) - 1
-            match = self._find_matching_bracket_forward(line_idx, col)
-            if match and match[0] > line_idx:
-                return (line_idx, match[0])
-        return None
-
-    def _find_enclosing_foldable(self, line_idx: int) -> tuple[int, int] | None:
-        """line_idx를 감싸는 가장 가까운 foldable 블록의 시작줄을 찾는다."""
-        for i in range(line_idx - 1, -1, -1):
-            rng = self._find_foldable_at(i)
-            if rng and rng[0] < line_idx <= rng[1]:
-                return rng
-        return None
-
-    def _is_line_folded(self, line_idx: int) -> bool:
-        """fold 안에 숨겨진 라인인지 확인."""
-        for start, end in self._folds.items():
-            if start < line_idx <= end:
-                return True
-        return False
-
-    def _next_visible_line(self, line_idx: int, direction: int = 1) -> int:
-        """다음/이전 보이는 라인 인덱스 반환."""
-        idx = line_idx + direction
-        while 0 <= idx < len(self.lines):
-            if not self._is_line_folded(idx):
-                return idx
-            idx += direction
-        return line_idx
-
-    def _skip_visible_lines(self, line_idx: int, count: int, direction: int = 1) -> int:
-        """보이는 라인 기준으로 count만큼 이동."""
-        idx = line_idx
-        for _ in range(count):
-            nxt = self._next_visible_line(idx, direction)
-            if nxt == idx:
-                break
-            idx = nxt
-        return idx
-
-    def _unfold_for_line(self, line_idx: int) -> None:
-        """line_idx를 숨기고 있는 fold를 모두 해제."""
-        to_remove = [s for s, e in self._folds.items() if s < line_idx <= e]
-        for s in to_remove:
-            del self._folds[s]
-
-    def _find_long_string_at(self, line_idx: int) -> tuple[int, int, int] | None:
-        """라인에서 긴 string value를 찾는다.
-
-        Returns (quote_start, quote_end, str_len) 또는 None.
-        quote_start/end는 따옴표 포함 위치.
-        """
-        line = self.lines[line_idx]
-        # ':' 뒤의 string value를 찾기
-        i = 0
-        while i < len(line):
-            if line[i] == '"':
-                start = i
-                i += 1
-                while i < len(line):
-                    if line[i] == '"' and line[i - 1] != '\\':
-                        break
-                    i += 1
-                end = i + 1  # 닫는 따옴표 포함
-                before = line[:start].rstrip()
-                if before.endswith(':'):
-                    str_len = end - start - 2  # 따옴표 제외 실제 문자열 길이
-                    if str_len >= self._string_collapse_threshold:
-                        return (start, end, str_len)
-            i += 1
-        return None
-
-    def _toggle_fold(self, line_idx: int) -> None:
-        """za: fold 토글. bracket fold 또는 string collapse."""
-        # bracket fold 토글
-        if line_idx in self._folds:
-            del self._folds[line_idx]
-            return
-        rng = self._find_foldable_at(line_idx)
-        if rng:
-            self._folds[rng[0]] = rng[1]
-            return
-        # 커서가 fold 안이면 해당 fold 펼기
-        for start, end in list(self._folds.items()):
-            if start < line_idx <= end:
-                del self._folds[start]
-                return
-        # string collapse 토글
-        if line_idx in self._collapsed_strings:
-            self._collapsed_strings.discard(line_idx)
-            return
-        if self._find_long_string_at(line_idx):
-            self._collapsed_strings.add(line_idx)
-
-    def _open_fold(self, line_idx: int) -> None:
-        """zo: fold 열기."""
-        if line_idx in self._folds:
-            del self._folds[line_idx]
-        self._collapsed_strings.discard(line_idx)
-
-    def _close_fold(self, line_idx: int) -> None:
-        """zc: fold 접기. 커서가 블록 안이면 해당 블록의 시작줄을 접는다."""
-        rng = self._find_foldable_at(line_idx)
-        if rng:
-            self._folds[rng[0]] = rng[1]
-            return
-        # string collapse (enclosing foldable보다 우선)
-        if self._find_long_string_at(line_idx):
-            self._collapsed_strings.add(line_idx)
-            return
-        # 현재 줄을 감싸는 foldable 블록 찾기
-        enclosing = self._find_enclosing_foldable(line_idx)
-        if enclosing:
-            self._folds[enclosing[0]] = enclosing[1]
-            self.cursor_row = enclosing[0]
-
-    def _fold_all(self) -> None:
-        """zM: 모든 top-level foldable 영역과 긴 string 접기."""
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        i = 0
-        while i < len(self.lines):
-            rng = self._find_foldable_at(i)
-            if rng:
-                self._folds[rng[0]] = rng[1]
-                i = rng[1] + 1  # 접힌 영역 건너뛰기 (top-level만)
+    if file_path:
+        path = Path(file_path)
+        try:
+            if path.exists():
+                initial_content = path.read_text(encoding="utf-8")
             else:
-                if self._find_long_string_at(i):
-                    self._collapsed_strings.add(i)
-                i += 1
+                # New file — start with empty object / empty line
+                initial_content = "" if jsonl else "{}"
+        except PermissionError as exc:
+            print(f"jvim: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-    def _unfold_all(self) -> None:
-        """zR: 모든 fold 해제."""
-        self._folds.clear()
-        self._collapsed_strings.clear()
+    app = JsonEditorApp(
+        file_path=file_path,
+        initial_content=initial_content,
+        read_only=args.read_only,
+        jsonl=jsonl,
+    )
+    app.run()
 
-    def _fold_all_nested(self) -> None:
-        """모든 depth의 foldable 블록과 긴 string을 접기 (root 제외)."""
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        for i in range(len(self.lines)):
-            rng = self._find_foldable_at(i)
-            if rng:
-                self._folds[rng[0]] = rng[1]
-            elif self._find_long_string_at(i):
-                self._collapsed_strings.add(i)
-        # root는 접지 않음
-        if 0 in self._folds:
-            del self._folds[0]
 
-    def _fold_at_depth(self, depth: int) -> None:
-        """지정된 depth의 foldable 블록과 긴 string을 접기."""
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        target_indent = depth * 4  # indent=4 기준
-        for i, line in enumerate(self.lines):
-            stripped = line.lstrip()
-            if not stripped:
-                continue
-            indent = len(line) - len(stripped)
-            if indent == target_indent:
-                rng = self._find_foldable_at(i)
-                if rng:
-                    self._folds[rng[0]] = rng[1]
-                elif self._find_long_string_at(i):
-                    self._collapsed_strings.add(i)
-
-    # -- Edit helpers ------------------------------------------------------
-
-    def _delete_word(self) -> None:
-        line = self.lines[self.cursor_row]
-        col = self.cursor_col
-        start = col
-        while col < len(line) and (line[col].isalnum() or line[col] == "_"):
-            col += 1
-        while col < len(line) and line[col] == " ":
-            col += 1
-        if col == start and col < len(line):
-            col += 1
-        self.lines[self.cursor_row] = line[:start] + line[col:]
-
-    def _paste_after(self) -> None:
-        if not self.yank_buffer:
-            return
-        self._save_undo()
-        for i, line in enumerate(self.yank_buffer):
-            self.lines.insert(self.cursor_row + 1 + i, line)
-        self.cursor_row += 1
-        self.cursor_col = 0
-
-    def _paste_before(self) -> None:
-        if not self.yank_buffer:
-            return
-        self._save_undo()
-        for i, line in enumerate(self.yank_buffer):
-            self.lines.insert(self.cursor_row + i, line)
-        self.cursor_col = 0
-
-    def _join_lines(self) -> None:
-        if self.cursor_row >= len(self.lines) - 1:
-            return
-        self._save_undo()
-        cur = self.lines[self.cursor_row].rstrip()
-        nxt = self.lines[self.cursor_row + 1].lstrip()
-        self.cursor_col = len(cur)
-        self.lines[self.cursor_row] = cur + " " + nxt
-        self.lines.pop(self.cursor_row + 1)
-
-    def _undo(self) -> None:
-        if not self.undo_stack:
-            self.status_msg = "nothing to undo"
-            return
-        # Save current state for redo
-        self.redo_stack.append((self.lines[:], self.cursor_row, self.cursor_col))
-        lines, row, col = self.undo_stack.pop()
-        self.lines = lines
-        self.cursor_row = row
-        self.cursor_col = col
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        self._invalidate_caches()
-        self.status_msg = "undone"
-
-    def _redo(self) -> None:
-        if not self.redo_stack:
-            self.status_msg = "nothing to redo"
-            return
-        # Save current state for undo
-        self.undo_stack.append((self.lines[:], self.cursor_row, self.cursor_col))
-        lines, row, col = self.redo_stack.pop()
-        self.lines = lines
-        self.cursor_row = row
-        self.cursor_col = col
-        self._folds.clear()
-        self._collapsed_strings.clear()
-        self._invalidate_caches()
-        self.status_msg = "redone"
+if __name__ == "__main__":
+    main()

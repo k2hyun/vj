@@ -14,7 +14,7 @@ from textual.widgets import Button, Header, Static
 from rich.text import Text
 
 from .diff import DiffHunk, DiffTag, compute_json_diff
-from .editor import JsonEditor
+from .widget import JsonEditor
 
 
 class SyncJsonEditor(JsonEditor):
@@ -181,7 +181,7 @@ class DiffEditor(SyncJsonEditor):
 class JsonDiffApp(App):
     """Side-by-side JSON diff viewer."""
 
-    CSS_PATH = "diff_app.tcss"
+    CSS_PATH = "differ.tcss"
     TITLE = "JSON Diff"
     BINDINGS = []
     ENABLE_COMMAND_PALETTE = False

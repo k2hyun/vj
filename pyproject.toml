@@ -38,11 +38,11 @@ dev = [
 ]
 
 [project.scripts]
-jvim = "jvim.app:main"
-jvi = "jvim.app:main"
-jv = "jvim.app:main"
-jvimdiff = "jvim.diff_app:diff_main"
-jvd = "jvim.diff_app:diff_main"
+jvim = "jvim.editor:main"
+jvi = "jvim.editor:main"
+jv = "jvim.editor:main"
+jvimdiff = "jvim.differ:diff_main"
+jvd = "jvim.differ:diff_main"
 
 [project.urls]
 Homepage = "https://github.com/k2hyun/jvim"
