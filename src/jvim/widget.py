@@ -200,6 +200,11 @@ class JsonEditor(Widget, can_focus=True):
         # Clear redo stack on new edit
         if self.redo_stack:
             self.redo_stack.clear()
+        # Content changed: fold/collapse indices may be invalid
+        if self._folds:
+            self._folds.clear()
+        if self._collapsed_strings:
+            self._collapsed_strings.clear()
         self._invalidate_caches()
 
     def _clamp_cursor(self) -> None:
