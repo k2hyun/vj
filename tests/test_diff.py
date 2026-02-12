@@ -479,6 +479,98 @@ class TestDiffEditorEmbeddedJson:
         assert len(result.hunks) == 0
 
 
+class TestBlockLevelDiff:
+    """블록 단위 diff 최적화 테스트."""
+
+    def _make_array_json(self, n: int, modify_indices: set[int] | None = None) -> str:
+        """n개 요소의 배열 JSON 생성."""
+        items = []
+        for i in range(n):
+            name = "modified" if modify_indices and i in modify_indices else f"user_{i}"
+            items.append({"id": i, "name": name, "value": i * 10})
+        return json.dumps({"items": items}, indent=4, ensure_ascii=False)
+
+    def test_identical_large_array(self):
+        """동일 배열은 hunk 0개."""
+        data = self._make_array_json(100)
+        result = compute_json_diff(data, data, normalize=False)
+        assert len(result.hunks) == 0
+        assert all(t == DiffTag.EQUAL for t in result.left_line_tags)
+
+    def test_single_block_change(self):
+        """1개 요소 변경 시 REPLACE 범위가 해당 블록으로 제한."""
+        left = self._make_array_json(20)
+        right = self._make_array_json(20, modify_indices={5})
+        result = compute_json_diff(left, right, normalize=False)
+        assert len(result.hunks) > 0
+        # REPLACE 범위가 전체가 아닌 일부로 제한
+        replace_count = sum(1 for t in result.left_line_tags if t == DiffTag.REPLACE)
+        total_lines = len(result.left_lines)
+        assert replace_count < total_lines * 0.5
+
+    def test_block_insert(self):
+        """요소 추가 시 INSERT 발생."""
+        left = self._make_array_json(10)
+        right_data = json.loads(left)
+        right_data["items"].append({"id": 99, "name": "new", "value": 990})
+        right = json.dumps(right_data, indent=4, ensure_ascii=False)
+        result = compute_json_diff(left, right, normalize=False)
+        has_change = any(
+            t in (DiffTag.INSERT, DiffTag.REPLACE) for t in result.left_line_tags
+        )
+        assert has_change
+
+    def test_block_delete(self):
+        """요소 삭제 시 DELETE 발생."""
+        left = self._make_array_json(10)
+        right_data = json.loads(left)
+        right_data["items"].pop(3)
+        right = json.dumps(right_data, indent=4, ensure_ascii=False)
+        result = compute_json_diff(left, right, normalize=False)
+        has_change = any(
+            t in (DiffTag.DELETE, DiffTag.REPLACE) for t in result.left_line_tags
+        )
+        assert has_change
+
+    def test_fallback_flat_json(self):
+        """블록 없는 flat JSON은 기존 방식 동작."""
+        left = '{"a": 1, "b": 2}'
+        right = '{"a": 1, "b": 3}'
+        result = compute_json_diff(left, right, normalize=False)
+        assert len(result.hunks) > 0
+
+    def test_top_level_array(self):
+        """[{...}, ...] 최상위 배열 구조 지원."""
+        items = [{"id": i, "name": f"item_{i}"} for i in range(10)]
+        left = json.dumps(items, indent=4, ensure_ascii=False)
+        modified = json.loads(left)
+        modified[3]["name"] = "changed"
+        right = json.dumps(modified, indent=4, ensure_ascii=False)
+        result = compute_json_diff(left, right, normalize=False)
+        assert len(result.hunks) > 0
+        replace_count = sum(1 for t in result.left_line_tags if t == DiffTag.REPLACE)
+        assert replace_count < len(result.left_lines) * 0.5
+
+    def test_different_structure_fallback(self):
+        """양쪽 indent 불일치 시 폴백."""
+        left = json.dumps({"outer": [{"id": i} for i in range(10)]}, indent=4)
+        right = json.dumps([{"id": i} for i in range(10)], indent=4)
+        result = compute_json_diff(left, right, normalize=False)
+        assert len(result.left_lines) == len(result.right_lines)
+
+    def test_equal_lines_are_truly_equal(self):
+        """EQUAL 태그 라인은 좌우 동일."""
+        left = self._make_array_json(20)
+        right = self._make_array_json(20, modify_indices={5, 15})
+        result = compute_json_diff(left, right, normalize=False)
+        for i, tag in enumerate(result.left_line_tags):
+            if tag == DiffTag.EQUAL:
+                assert result.left_lines[i] == result.right_lines[i], (
+                    f"Line {i}: EQUAL tag but lines differ: "
+                    f"{result.left_lines[i]!r} vs {result.right_lines[i]!r}"
+                )
+
+
 class TestDiffFoldSync:
     """diff 뷰어에서 fold 동기화 테스트."""
 
