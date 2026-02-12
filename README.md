@@ -4,6 +4,14 @@ JSON editor with vim-style keybindings, built with [Textual](https://github.com/
 
 [한국어](README.kr.md)
 
+## Screenshots
+
+### Editor
+![jvim](docs/jvim.svg)
+
+### Diff Viewer
+![jvimdiff](docs/jvimdiff.svg)
+
 ## Features
 
 - **Vim-style modal editing** - Normal, Insert, Command, and Search modes

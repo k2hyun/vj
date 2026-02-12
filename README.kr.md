@@ -2,6 +2,14 @@
 
 [Textual](https://github.com/Textualize/textual) 기반의 vim 스타일 JSON 편집기입니다.
 
+## 스크린샷
+
+### 편집기
+![jvim](docs/jvim.svg)
+
+### Diff 뷰어
+![jvimdiff](docs/jvimdiff.svg)
+
 ## 주요 기능
 
 - **Vim 스타일 모달 편집** - Normal, Insert, Command, Search 모드 지원
