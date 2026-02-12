@@ -86,7 +86,9 @@ class DiffEditor(SyncJsonEditor):
         id: str | None = None,
         classes: str | None = None,
     ) -> None:
-        super().__init__(initial_content, read_only=True, name=name, id=id, classes=classes)
+        super().__init__(
+            initial_content, read_only=True, name=name, id=id, classes=classes
+        )
         self._line_tags: list[DiffTag] = []
         self._filler_rows: set[int] = set()
         self._diff_hunks: list[DiffHunk] = []
@@ -235,7 +237,8 @@ class JsonDiffApp(App):
             del editor._folds[s]
         # diff가 있는 collapsed string도 펼기
         to_expand = [
-            i for i in editor._collapsed_strings
+            i
+            for i in editor._collapsed_strings
             if i < len(editor._line_tags) and editor._line_tags[i] != DiffTag.EQUAL
         ]
         for i in to_expand:
@@ -246,8 +249,10 @@ class JsonDiffApp(App):
         right_content = Path(self.right_path).read_text(encoding="utf-8")
 
         diff_result = compute_json_diff(
-            left_content, right_content,
-            normalize=self.normalize, jsonl=self.jsonl,
+            left_content,
+            right_content,
+            normalize=self.normalize,
+            jsonl=self.jsonl,
         )
 
         left_editor = self.query_one("#left-editor", DiffEditor)
@@ -255,25 +260,31 @@ class JsonDiffApp(App):
 
         # filler 행 계산: 빈 문자열이고 EQUAL이 아닌 행
         left_fillers = {
-            i for i, (line, tag) in enumerate(
+            i
+            for i, (line, tag) in enumerate(
                 zip(diff_result.left_lines, diff_result.left_line_tags)
             )
             if not line and tag != DiffTag.EQUAL
         }
         right_fillers = {
-            i for i, (line, tag) in enumerate(
+            i
+            for i, (line, tag) in enumerate(
                 zip(diff_result.right_lines, diff_result.right_line_tags)
             )
             if not line and tag != DiffTag.EQUAL
         }
 
         left_editor.set_diff_data(
-            diff_result.left_lines, diff_result.left_line_tags,
-            left_fillers, diff_result.hunks,
+            diff_result.left_lines,
+            diff_result.left_line_tags,
+            left_fillers,
+            diff_result.hunks,
         )
         right_editor.set_diff_data(
-            diff_result.right_lines, diff_result.right_line_tags,
-            right_fillers, diff_result.hunks,
+            diff_result.right_lines,
+            diff_result.right_line_tags,
+            right_fillers,
+            diff_result.hunks,
         )
 
         # 렌더 타임 스크롤 동기화 설정
@@ -333,13 +344,16 @@ class JsonDiffApp(App):
         # EJ 에디터에서 중첩 호출
         if fid == f"{side}-ej-editor":
             ej_stack = self._left_ej_stack if side == "left" else self._right_ej_stack
-            other_ej_stack = self._right_ej_stack if side == "left" else self._left_ej_stack
+            other_ej_stack = (
+                self._right_ej_stack if side == "left" else self._left_ej_stack
+            )
             ej_editor = self.query_one(f"#{side}-ej-editor", DiffEditor)
             other_ej_editor = self.query_one(f"#{other_side}-ej-editor", DiffEditor)
 
             this_content = event.content
             other_content = self._find_ej_content_in(
-                other_ej_editor, event.source_row,
+                other_ej_editor,
+                event.source_row,
             )
 
             ej_stack.append(ej_editor.get_content())
@@ -379,7 +393,9 @@ class JsonDiffApp(App):
         self.query_one(f"#{side}-ej-editor", DiffEditor).focus()
 
     def _find_ej_content_in(
-        self, editor: DiffEditor, source_row: int,
+        self,
+        editor: DiffEditor,
+        source_row: int,
     ) -> str | None:
         """에디터의 지정 행에서 임베디드 JSON을 찾아 포맷팅된 문자열 반환."""
         if source_row >= len(editor.lines):
@@ -402,37 +418,43 @@ class JsonDiffApp(App):
         except (json.JSONDecodeError, ValueError):
             return None
 
-    def _open_ej_with_diff(
-        self, left_content: str, right_content: str
-    ) -> None:
+    def _open_ej_with_diff(self, left_content: str, right_content: str) -> None:
         """양쪽 EJ 패널에 diff 결과를 표시."""
         diff_result = compute_json_diff(
-            left_content, right_content, normalize=False,
+            left_content,
+            right_content,
+            normalize=False,
         )
 
         left_ej = self.query_one("#left-ej-editor", DiffEditor)
         right_ej = self.query_one("#right-ej-editor", DiffEditor)
 
         left_fillers = {
-            i for i, (line, tag) in enumerate(
+            i
+            for i, (line, tag) in enumerate(
                 zip(diff_result.left_lines, diff_result.left_line_tags)
             )
             if not line and tag != DiffTag.EQUAL
         }
         right_fillers = {
-            i for i, (line, tag) in enumerate(
+            i
+            for i, (line, tag) in enumerate(
                 zip(diff_result.right_lines, diff_result.right_line_tags)
             )
             if not line and tag != DiffTag.EQUAL
         }
 
         left_ej.set_diff_data(
-            diff_result.left_lines, diff_result.left_line_tags,
-            left_fillers, diff_result.hunks,
+            diff_result.left_lines,
+            diff_result.left_line_tags,
+            left_fillers,
+            diff_result.hunks,
         )
         right_ej.set_diff_data(
-            diff_result.right_lines, diff_result.right_line_tags,
-            right_fillers, diff_result.hunks,
+            diff_result.right_lines,
+            diff_result.right_line_tags,
+            right_fillers,
+            diff_result.hunks,
         )
 
         left_ej._update_hunk_status()
@@ -521,9 +543,7 @@ def main() -> None:
     # JSONL 자동 감지: 둘 중 하나라도 .jsonl 확장자면 JSONL 모드
     jsonl = args.jsonl
     if jsonl is None:
-        jsonl = any(
-            f.lower().endswith(".jsonl") for f in (args.file1, args.file2)
-        )
+        jsonl = any(f.lower().endswith(".jsonl") for f in (args.file1, args.file2))
 
     app = JsonDiffApp(
         left_path=args.file1,

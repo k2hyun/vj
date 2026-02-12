@@ -10,8 +10,8 @@ from enum import Enum, auto
 
 class DiffTag(Enum):
     EQUAL = auto()
-    INSERT = auto()   # 우측에만 존재
-    DELETE = auto()   # 좌측에만 존재
+    INSERT = auto()  # 우측에만 존재
+    DELETE = auto()  # 좌측에만 존재
     REPLACE = auto()  # 양쪽 다르게 존재
 
 
@@ -19,7 +19,7 @@ class DiffTag(Enum):
 class DiffHunk:
     """연속된 변경 블록."""
 
-    left_start: int   # 정렬된 라인 배열에서의 시작 (0-based)
+    left_start: int  # 정렬된 라인 배열에서의 시작 (0-based)
     left_count: int
     right_start: int
     right_count: int
@@ -79,7 +79,9 @@ def normalize_jsonl(content: str) -> str:
             continue
         try:
             parsed = json.loads(stripped)
-            blocks.append(json.dumps(parsed, indent=4, ensure_ascii=False, sort_keys=True))
+            blocks.append(
+                json.dumps(parsed, indent=4, ensure_ascii=False, sort_keys=True)
+            )
         except json.JSONDecodeError:
             blocks.append(stripped)
     return "\n\n".join(blocks)
@@ -95,7 +97,9 @@ def _parse_jsonl_records(content: str, normalize: bool) -> list[str]:
         try:
             parsed = json.loads(stripped)
             if normalize:
-                records.append(json.dumps(parsed, indent=4, ensure_ascii=False, sort_keys=True))
+                records.append(
+                    json.dumps(parsed, indent=4, ensure_ascii=False, sort_keys=True)
+                )
             else:
                 records.append(json.dumps(parsed, indent=4, ensure_ascii=False))
         except json.JSONDecodeError:
@@ -103,7 +107,9 @@ def _parse_jsonl_records(content: str, normalize: bool) -> list[str]:
     return records
 
 
-def _append_lines(result: DiffResult, left_lines: list[str], right_lines: list[str], tag: DiffTag) -> None:
+def _append_lines(
+    result: DiffResult, left_lines: list[str], right_lines: list[str], tag: DiffTag
+) -> None:
     """정렬된 라인 쌍을 result에 추가. 짧은 쪽은 filler로 패딩."""
     max_count = max(len(left_lines), len(right_lines))
     for k in range(max_count):
@@ -114,7 +120,9 @@ def _append_lines(result: DiffResult, left_lines: list[str], right_lines: list[s
     return max_count
 
 
-def _line_diff(result: DiffResult, left_lines: list[str], right_lines: list[str]) -> None:
+def _line_diff(
+    result: DiffResult, left_lines: list[str], right_lines: list[str]
+) -> None:
     """변경된 레코드 내부를 라인 단위 diff."""
     matcher = SequenceMatcher(None, left_lines, right_lines)
     hunk_start = len(result.left_lines)
@@ -129,7 +137,11 @@ def _line_diff(result: DiffResult, left_lines: list[str], right_lines: list[str]
                 result.right_line_tags.append(DiffTag.EQUAL)
             total += lc
         else:
-            dt = {"delete": DiffTag.DELETE, "insert": DiffTag.INSERT, "replace": DiffTag.REPLACE}[tag]
+            dt = {
+                "delete": DiffTag.DELETE,
+                "insert": DiffTag.INSERT,
+                "replace": DiffTag.REPLACE,
+            }[tag]
             mc = max(lc, rc)
             for k in range(mc):
                 result.left_lines.append(left_lines[i1 + k] if k < lc else "")
@@ -138,11 +150,15 @@ def _line_diff(result: DiffResult, left_lines: list[str], right_lines: list[str]
                 result.right_line_tags.append(dt)
             total += mc
     if total:
-        result.hunks.append(DiffHunk(
-            left_start=hunk_start, left_count=total,
-            right_start=hunk_start, right_count=total,
-            tag=DiffTag.REPLACE,
-        ))
+        result.hunks.append(
+            DiffHunk(
+                left_start=hunk_start,
+                left_count=total,
+                right_start=hunk_start,
+                right_count=total,
+                tag=DiffTag.REPLACE,
+            )
+        )
 
 
 def compute_json_diff(
@@ -187,11 +203,15 @@ def _compute_line_diff(left_src: list[str], right_src: list[str]) -> DiffResult:
                 result.right_lines.append("")
                 result.left_line_tags.append(DiffTag.DELETE)
                 result.right_line_tags.append(DiffTag.DELETE)
-            result.hunks.append(DiffHunk(
-                left_start=hunk_start, left_count=left_count,
-                right_start=hunk_start, right_count=left_count,
-                tag=DiffTag.DELETE,
-            ))
+            result.hunks.append(
+                DiffHunk(
+                    left_start=hunk_start,
+                    left_count=left_count,
+                    right_start=hunk_start,
+                    right_count=left_count,
+                    tag=DiffTag.DELETE,
+                )
+            )
 
         elif tag == "insert":
             hunk_start = len(result.left_lines)
@@ -200,11 +220,15 @@ def _compute_line_diff(left_src: list[str], right_src: list[str]) -> DiffResult:
                 result.right_lines.append(right_src[j1 + k])
                 result.left_line_tags.append(DiffTag.INSERT)
                 result.right_line_tags.append(DiffTag.INSERT)
-            result.hunks.append(DiffHunk(
-                left_start=hunk_start, left_count=right_count,
-                right_start=hunk_start, right_count=right_count,
-                tag=DiffTag.INSERT,
-            ))
+            result.hunks.append(
+                DiffHunk(
+                    left_start=hunk_start,
+                    left_count=right_count,
+                    right_start=hunk_start,
+                    right_count=right_count,
+                    tag=DiffTag.INSERT,
+                )
+            )
 
         elif tag == "replace":
             hunk_start = len(result.left_lines)
@@ -216,11 +240,15 @@ def _compute_line_diff(left_src: list[str], right_src: list[str]) -> DiffResult:
                 result.right_lines.append(r_line)
                 result.left_line_tags.append(DiffTag.REPLACE)
                 result.right_line_tags.append(DiffTag.REPLACE)
-            result.hunks.append(DiffHunk(
-                left_start=hunk_start, left_count=max_count,
-                right_start=hunk_start, right_count=max_count,
-                tag=DiffTag.REPLACE,
-            ))
+            result.hunks.append(
+                DiffHunk(
+                    left_start=hunk_start,
+                    left_count=max_count,
+                    right_start=hunk_start,
+                    right_count=max_count,
+                    tag=DiffTag.REPLACE,
+                )
+            )
 
     return result
 
@@ -262,11 +290,15 @@ def _compute_jsonl_diff(left: str, right: str, normalize: bool) -> DiffResult:
                 hunk_start = len(result.left_lines)
                 rec_lines = left_records[i1 + k].split("\n")
                 cnt = _append_lines(result, rec_lines, [], DiffTag.DELETE)
-                result.hunks.append(DiffHunk(
-                    left_start=hunk_start, left_count=cnt,
-                    right_start=hunk_start, right_count=cnt,
-                    tag=DiffTag.DELETE,
-                ))
+                result.hunks.append(
+                    DiffHunk(
+                        left_start=hunk_start,
+                        left_count=cnt,
+                        right_start=hunk_start,
+                        right_count=cnt,
+                        tag=DiffTag.DELETE,
+                    )
+                )
 
         elif tag == "insert":
             for k in range(j2 - j1):
@@ -279,11 +311,15 @@ def _compute_jsonl_diff(left: str, right: str, normalize: bool) -> DiffResult:
                 hunk_start = len(result.left_lines)
                 rec_lines = right_records[j1 + k].split("\n")
                 cnt = _append_lines(result, [], rec_lines, DiffTag.INSERT)
-                result.hunks.append(DiffHunk(
-                    left_start=hunk_start, left_count=cnt,
-                    right_start=hunk_start, right_count=cnt,
-                    tag=DiffTag.INSERT,
-                ))
+                result.hunks.append(
+                    DiffHunk(
+                        left_start=hunk_start,
+                        left_count=cnt,
+                        right_start=hunk_start,
+                        right_count=cnt,
+                        tag=DiffTag.INSERT,
+                    )
+                )
 
         elif tag == "replace":
             l_count = i2 - i1
@@ -320,11 +356,15 @@ def _compute_jsonl_diff(left: str, right: str, normalize: bool) -> DiffResult:
                 hunk_start = len(result.left_lines)
                 rec_lines = left_records[i1 + k].split("\n")
                 cnt = _append_lines(result, rec_lines, [], DiffTag.DELETE)
-                result.hunks.append(DiffHunk(
-                    left_start=hunk_start, left_count=cnt,
-                    right_start=hunk_start, right_count=cnt,
-                    tag=DiffTag.DELETE,
-                ))
+                result.hunks.append(
+                    DiffHunk(
+                        left_start=hunk_start,
+                        left_count=cnt,
+                        right_start=hunk_start,
+                        right_count=cnt,
+                        tag=DiffTag.DELETE,
+                    )
+                )
 
             # 나머지: 우측 초과분 → INSERT
             for k in range(paired, r_count):
@@ -337,10 +377,14 @@ def _compute_jsonl_diff(left: str, right: str, normalize: bool) -> DiffResult:
                 hunk_start = len(result.left_lines)
                 rec_lines = right_records[j1 + k].split("\n")
                 cnt = _append_lines(result, [], rec_lines, DiffTag.INSERT)
-                result.hunks.append(DiffHunk(
-                    left_start=hunk_start, left_count=cnt,
-                    right_start=hunk_start, right_count=cnt,
-                    tag=DiffTag.INSERT,
-                ))
+                result.hunks.append(
+                    DiffHunk(
+                        left_start=hunk_start,
+                        left_count=cnt,
+                        right_start=hunk_start,
+                        right_count=cnt,
+                        tag=DiffTag.INSERT,
+                    )
+                )
 
     return result

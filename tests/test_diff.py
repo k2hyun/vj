@@ -79,8 +79,7 @@ class TestComputeJsonDiff:
         assert len(result.hunks) > 0
         # 우측에 INSERT 또는 REPLACE 태그가 존재해야 함
         has_change = any(
-            t in (DiffTag.INSERT, DiffTag.REPLACE)
-            for t in result.right_line_tags
+            t in (DiffTag.INSERT, DiffTag.REPLACE) for t in result.right_line_tags
         )
         assert has_change
 
@@ -90,8 +89,7 @@ class TestComputeJsonDiff:
         result = compute_json_diff(left, right)
         assert len(result.hunks) > 0
         has_change = any(
-            t in (DiffTag.DELETE, DiffTag.REPLACE)
-            for t in result.left_line_tags
+            t in (DiffTag.DELETE, DiffTag.REPLACE) for t in result.left_line_tags
         )
         assert has_change
 
@@ -548,7 +546,9 @@ class TestDiffFoldSync:
                 tags[i] != DiffTag.EQUAL for i in range(start, end + 1) if i < len(tags)
             )
             if has_diff:
-                assert start not in editor._folds, f"fold at {start} should be unfolded (has diff)"
+                assert start not in editor._folds, (
+                    f"fold at {start} should be unfolded (has diff)"
+                )
             else:
                 assert start in editor._folds, f"fold at {start} should remain folded"
 
@@ -566,10 +566,13 @@ class TestDiffFoldSync:
     def test_nested_fold_preserves_clean_siblings(self):
         """diff가 있는 depth-1 블록을 열어도, 안쪽 diff 없는 블록은 접힌 상태 유지."""
         # "a" 블록에 diff가 있지만 "a.inner"에는 없음
-        content = json.dumps({
-            "a": {"inner": {"x": 1, "y": 2}, "changed": "val"},
-            "b": {"clean": {"z": 3}},
-        }, indent=4)
+        content = json.dumps(
+            {
+                "a": {"inner": {"x": 1, "y": 2}, "changed": "val"},
+                "b": {"clean": {"z": 3}},
+            },
+            indent=4,
+        )
         lines = content.split("\n")
         tags = [DiffTag.EQUAL] * len(lines)
         # "changed" 라인에만 REPLACE
@@ -590,7 +593,7 @@ class TestDiffFoldSync:
         # "b" 블록은 diff 없으므로 접힌 상태
         b_start = None
         for i, line in enumerate(lines):
-            if '"b"' in line and '{' in line:
+            if '"b"' in line and "{" in line:
                 b_start = i
                 break
         assert b_start is not None
@@ -599,7 +602,7 @@ class TestDiffFoldSync:
         # "a.inner" 블록도 diff 없으므로 접힌 상태
         inner_start = None
         for i, line in enumerate(lines):
-            if '"inner"' in line and '{' in line:
+            if '"inner"' in line and "{" in line:
                 inner_start = i
                 break
         assert inner_start is not None
