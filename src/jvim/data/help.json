@@ -36,6 +36,21 @@
         ".": "repeat last edit",
         "ej": "edit embedded JSON string"
     },
+    "Visual Mode": {
+        "v": "character-wise selection",
+        "V": "line-wise selection",
+        "d": "delete selection",
+        "y": "yank selection",
+        "c": "change selection",
+        "Esc": "exit visual mode"
+    },
+    "Folding": {
+        "za": "toggle fold",
+        "zo": "open fold",
+        "zc": "close fold",
+        "zM": "fold all",
+        "zR": "unfold all"
+    },
     "Commands": {
         ":w": "save",
         ":w {file}": "save as",

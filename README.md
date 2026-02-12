@@ -12,6 +12,8 @@ JSON editor with vim-style keybindings, built with [Textual](https://github.com/
 - **JSONPath search** - Search using JSONPath expressions (`$.foo.bar`)
 - **JSONL support** - Edit JSON Lines files with smart formatting
 - **Embedded JSON editing** - Edit JSON strings within JSON with nested level support
+- **Visual mode** - Character-wise (`v`) and line-wise (`V`) selection with `d`/`y`/`c` operators
+- **Folding** - Collapse/expand JSON blocks and long string values
 - **Bracket matching** - Jump to matching brackets with `%`
 - **Undo/Redo** - Full undo history
 
@@ -133,7 +135,8 @@ JSON files often contain escaped JSON strings as values. jvim lets you edit thes
 You can edit embedded JSON within embedded JSON:
 - The panel title shows the current nesting level: `Edit Embedded JSON (level 1)`
 - A `[+]` indicator appears when you have unsaved changes
-- `:w` saves and returns to the previous level
+- `:w` saves to the parent document and continues editing
+- `:wq` saves and returns to the previous level
 - `:q!` discards changes and returns to the previous level
 
 ### Example
@@ -157,62 +160,7 @@ After editing and saving, the parent is updated with the minified result.
 
 ## Keybindings
 
-### Movement
-| Key | Action |
-|-----|--------|
-| `h j k l` | Left/Down/Up/Right |
-| `w b` | Word forward/backward |
-| `0 $ ^` | Line start/end/first char |
-| `gg G` | File start/end |
-| `%` | Jump to matching bracket |
-| `PgUp PgDn` | Page up/down |
-| `Ctrl+d/u` | Half page down/up |
-
-### Search
-| Key | Action |
-|-----|--------|
-| `/` | Search forward |
-| `?` | Search backward |
-| `n N` | Next/previous match |
-| `$.path` | JSONPath search (auto-detect) |
-| `$.path=val` | JSONPath with value filter |
-| `$.path~regex` | JSONPath with regex filter |
-| `\j` | JSONPath suffix for patterns |
-| `\c \C` | Case insensitive/sensitive |
-
-### Insert Mode
-| Key | Action |
-|-----|--------|
-| `i I` | Insert at cursor/line start |
-| `a A` | Append after cursor/line end |
-| `o O` | Open line below/above |
-
-### Editing
-| Key | Action |
-|-----|--------|
-| `x` | Delete char |
-| `dd` | Delete line |
-| `dw d$` | Delete word/to end |
-| `cw cc` | Change word/line |
-| `r{c}` | Replace char |
-| `J` | Join lines |
-| `yy p P` | Yank/paste after/before |
-| `u` | Undo |
-| `Ctrl+r` | Redo |
-| `.` | Repeat last edit |
-| `ej` | Edit embedded JSON string |
-
-### Commands
-| Command | Action |
-|---------|--------|
-| `:w` | Save |
-| `:w {file}` | Save as |
-| `:e {file}` | Open file |
-| `:fmt` | Format JSON |
-| `:q` | Quit |
-| `:q!` | Quit (discard changes) |
-| `:wq` | Save and quit |
-| `:help` | Toggle help panel |
+Use `:help` inside jvim to see the full keybinding reference.
 
 ## License
 
