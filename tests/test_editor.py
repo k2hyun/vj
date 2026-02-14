@@ -1,6 +1,7 @@
 """Tests for JsonEditor widget."""
 
 from src.jvim.widget import JsonEditor, EditorMode
+from src.jvim._jsonpath import parse_jsonpath_filter, jsonpath_value_matches
 
 
 class TestEditorBasic:
@@ -385,125 +386,102 @@ class TestJsonPathFilter:
     """Tests for JSONPath search with value filtering."""
 
     def test_parse_filter_equals_string(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter('$.name="John"')
+        path, op, val = parse_jsonpath_filter('$.name="John"')
 
         assert path == "$.name"
         assert op == "="
         assert val == "John"
 
     def test_parse_filter_equals_number(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.age=30")
+        path, op, val = parse_jsonpath_filter("$.age=30")
 
         assert path == "$.age"
         assert op == "="
         assert val == 30
 
     def test_parse_filter_greater_than(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.age>18")
+        path, op, val = parse_jsonpath_filter("$.age>18")
 
         assert path == "$.age"
         assert op == ">"
         assert val == 18
 
     def test_parse_filter_less_than(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.price<100")
+        path, op, val = parse_jsonpath_filter("$.price<100")
 
         assert path == "$.price"
         assert op == "<"
         assert val == 100
 
     def test_parse_filter_greater_or_equal(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.count>=5")
+        path, op, val = parse_jsonpath_filter("$.count>=5")
 
         assert path == "$.count"
         assert op == ">="
         assert val == 5
 
     def test_parse_filter_less_or_equal(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.count<=10")
+        path, op, val = parse_jsonpath_filter("$.count<=10")
 
         assert path == "$.count"
         assert op == "<="
         assert val == 10
 
     def test_parse_filter_not_equals(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.status!=null")
+        path, op, val = parse_jsonpath_filter("$.status!=null")
 
         assert path == "$.status"
         assert op == "!="
         assert val is None
 
     def test_parse_filter_regex(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.name~^J")
+        path, op, val = parse_jsonpath_filter("$.name~^J")
 
         assert path == "$.name"
         assert op == "~"
         assert val == "^J"
 
     def test_parse_filter_no_filter(self):
-        editor = JsonEditor()
-        path, op, val = editor._parse_jsonpath_filter("$.users[*].name")
+        path, op, val = parse_jsonpath_filter("$.users[*].name")
 
         assert path == "$.users[*].name"
         assert op == ""
         assert val is None
 
     def test_value_matches_equals(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches("John", "=", "John")
-        assert not editor._jsonpath_value_matches("Jane", "=", "John")
-        assert editor._jsonpath_value_matches(30, "=", 30)
+        assert jsonpath_value_matches("John", "=", "John")
+        assert not jsonpath_value_matches("Jane", "=", "John")
+        assert jsonpath_value_matches(30, "=", 30)
 
     def test_value_matches_not_equals(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches("Jane", "!=", "John")
-        assert not editor._jsonpath_value_matches("John", "!=", "John")
+        assert jsonpath_value_matches("Jane", "!=", "John")
+        assert not jsonpath_value_matches("John", "!=", "John")
 
     def test_value_matches_greater(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches(30, ">", 18)
-        assert not editor._jsonpath_value_matches(18, ">", 18)
-        assert not editor._jsonpath_value_matches(10, ">", 18)
+        assert jsonpath_value_matches(30, ">", 18)
+        assert not jsonpath_value_matches(18, ">", 18)
+        assert not jsonpath_value_matches(10, ">", 18)
 
     def test_value_matches_less(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches(10, "<", 18)
-        assert not editor._jsonpath_value_matches(18, "<", 18)
-        assert not editor._jsonpath_value_matches(30, "<", 18)
+        assert jsonpath_value_matches(10, "<", 18)
+        assert not jsonpath_value_matches(18, "<", 18)
+        assert not jsonpath_value_matches(30, "<", 18)
 
     def test_value_matches_greater_or_equal(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches(30, ">=", 18)
-        assert editor._jsonpath_value_matches(18, ">=", 18)
-        assert not editor._jsonpath_value_matches(10, ">=", 18)
+        assert jsonpath_value_matches(30, ">=", 18)
+        assert jsonpath_value_matches(18, ">=", 18)
+        assert not jsonpath_value_matches(10, ">=", 18)
 
     def test_value_matches_less_or_equal(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches(10, "<=", 18)
-        assert editor._jsonpath_value_matches(18, "<=", 18)
-        assert not editor._jsonpath_value_matches(30, "<=", 18)
+        assert jsonpath_value_matches(10, "<=", 18)
+        assert jsonpath_value_matches(18, "<=", 18)
+        assert not jsonpath_value_matches(30, "<=", 18)
 
     def test_value_matches_regex(self):
-        editor = JsonEditor()
-
-        assert editor._jsonpath_value_matches("John", "~", "^J")
-        assert editor._jsonpath_value_matches("Jane", "~", "^J")
-        assert not editor._jsonpath_value_matches("Mary", "~", "^J")
-        assert editor._jsonpath_value_matches("test@email.com", "~", r"@.*\.com$")
+        assert jsonpath_value_matches("John", "~", "^J")
+        assert jsonpath_value_matches("Jane", "~", "^J")
+        assert not jsonpath_value_matches("Mary", "~", "^J")
+        assert jsonpath_value_matches("test@email.com", "~", r"@.*\.com$")
 
     def test_search_with_equals_filter(self):
         editor = JsonEditor('{"users": [{"name": "John"}, {"name": "Jane"}]}')
